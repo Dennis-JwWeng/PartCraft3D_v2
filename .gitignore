@@ -1,0 +1,103 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.so
+
+outputs/
+cache/
+logs/
+checkpoints/
+data/
+archive_v1/
+
+# Symlink created at runtime by prerender scripts
+third_party/outputs
+
+# Vendored upstream TRELLIS.2 clone (its own .git repo, not a submodule)
+third_party/TRELLIS.2/
+
+# Runtime logs
+*.out
+*.log
+
+# Dependency snapshots
+*-pip.txt
+*-pip-all.txt
+
+# Archives
+*.tar.gz
+*.zip
+
+# Secrets and local env
+.env
+.env.*
+
+# Config files contain API keys or are local-only
+configs/default.yaml
+configs/partobjaverse.yaml
+qwen.yaml
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+outputs
+
+# Git worktrees
+.worktrees/
+/data
+
+# Generated reports / HTML dashboards
+reports/
+
+# Manual / agent-cached file backups
+*.bak_*
+.efc_*
+
+# HuggingFace dataset working dir (its own git repo, not a submodule)
+/H3D_v1_hf
+
+# Local pipeline/debug artifacts
+/debug_unilat_render/
+/show-3deditverse/
+
+# Claude scheduler state
+/.claude/
+
+# Backup files (editor / agent caches)
+*.bak.*
+
+# One-shot visualization scripts (kept local, not version controlled)
+/scripts/vis/
+/scripts/tools/render_*.py
+/scripts/tools/annotate_*.py
+/scripts/tools/build_h3d_manual_keep_*.py
+/scripts/tools/build_nano_quad_compare_sheets.py
+/scripts/tools/export_bench_compare_turntable_merged.py
+/scripts/tools/watch_triptych_batch.sh
+/scripts/tools/write_v6_nano_pairing_edit_sidecars.py
+/scripts/tools/.write_test
+
+# bench_review local result/output dirs
+/bench_review/default_val_test_available_zip_review/
+/bench_review/h3d_bench_del_gs_scale_offset_check_20/
+/bench_review/h3d_v1_non_add_del_*/
+/bench_review/single_h3d_viz_*/
+/bench_review/turntable/
+/bench_review/viz_bundle_*/
+/bench_review/manual_keep_mini140_*/
+/bench_review/manual_keep_*.csv
+/bench_review/manual_keep_*.jsonl
+/bench_review/manual_keep_*.json
+/bench_review/local_glb_*.json
+/configs/_gen/
+/logs/salvage/

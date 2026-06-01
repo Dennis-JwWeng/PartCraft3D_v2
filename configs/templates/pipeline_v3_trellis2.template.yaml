@@ -1,0 +1,212 @@
+# =====================================================================
+# Pipeline v3 — single-shard template  [TRELLIS.2 variant]
+# =====================================================================
+#
+# 与 pipeline_v3_bench.template.yaml 的区别：
+#   * 3D 重建用 TRELLIS.2（image→3D，O-Voxel），不走 v1 SLAT 编辑路径
+#   * "编辑" = 直接把 FLUX 编辑后的 2D 图喂给 v2 重新生成
+#   * 输出 edits_3d/<edit_id>/{before,after}.glb（不是 .npz）
+#   * preview_flux / render_3d 暂时无法消费 v2 输出，stages 里已移除
+#
+# 怎么跑：
+#   1) 拷贝模板：
+#        cp configs/templates/pipeline_v3_trellis2.template.yaml \
+#           configs/my_run_trellis2.yaml
+#   2) 配置机器 env (与 v1 共用 configs/machine/$(hostname).env)
+#   3) 启动管线（注意是 trellis2 那份 shell）：
+#        bash run_pipeline_v3_shard_trellis2.sh \
+#             <tag> configs/my_run_trellis2.yaml
+#
+# Stage 顺序：gen_edits → gate_text_align → (del_mesh ∥ flux_2d → trellis2_3d)
+#             → gate_quality?  (gate_quality 需要后续接 v2 预览渲染才能用)
+# 单一权威视角：每条 edit 的 2D 输入视角来自
+#   edit_status.json.edits.<id>.gates.A.vlm.best_view  (由 gate_text_align 写)
+#   缺失 → from_parsed_edit 抛 ValueError，不会用固定视角兜底。
+#
+# 单步运行（断点续跑或调试用）：
+#   bash scripts/tools/run_pipeline_v3_shard.sh configs/my_run.yaml \
+#       --steps gate_text_align,flux_2d
+#   --force 可重跑已 done 的 edit（仍尊重 gate_a prereq）。
+#
+# 重跑某类编辑：
+#   python scripts/tools/reset_v3_edits_by_type.py <output_dir> --type material
+#   再 rerun pipeline。
+# =====================================================================
+
+blender: /path/to/blender
+ckpt_root: /path/to/checkpoints
+
+data:
+  # Example:
+  # output_dir: /mnt/zsn/zsn_workspace/PartCraft3D/outputs/partverse/bench_shard08_test20/mode_e_text_align
+  output_dir: /path/to/outputs/partverse/<run_name>
+
+  # Bench inputs root split (required):
+  #   <inputs>/mesh/<shard>/<obj_id>.npz
+  #   <inputs>/images/<shard>/<obj_id>.npz
+  #   <inputs>/slat/<shard>/<obj_id>_{coords,feats}.pt
+  mesh_root: /path/to/bench/inputs/mesh
+  images_root: /path/to/bench/inputs/images
+  slat_dir: /path/to/bench/inputs/slat
+
+pipeline:
+  gpus: [0, 1, 2, 3]
+
+  # Service ports (one server per GPU unless overridden).
+  vlm_port_base: 8200
+  vlm_port_stride: 1
+  flux_port_base: 8020
+  flux_port_stride: 1
+
+  prerender_workers: 6
+  s6p_del_workers: 6
+
+  # Scheduler source of truth
+  stages:
+  - name: text_gen_gate_a
+    desc: VLM edit generation + text-align gate
+    servers: vlm
+    steps:
+    - gen_edits
+    - gate_text_align
+
+
+  - name: del_mesh
+    desc: Deletion mesh masking (CPU). Produces del_*/after_new.glb plus
+      add_*/meta.json — terminal for the deletion/addition data branch
+      (no rendering needed unless preview_del is opted in).
+    servers: none
+    parallel_group: edit_branches
+    steps:
+    - del_mesh
+
+  - name: flux_2d
+    desc: FLUX 2D image editing (modification / style / material / scale /
+      colour / global / addition).
+    servers: flux
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 0
+    steps:
+    - flux_2d
+
+  - name: gate_2d
+    desc: >
+      Gate C — VLM judges each FLUX before→after image pair against the
+      instruction (edit applied to the right part, rest preserved). Runs
+      after flux_2d, BEFORE the 3D edit, so a 2D edit that does not match
+      the prompt never reaches TRELLIS.2 (trellis2_3d is gated on
+      gate_c==pass). Writes gate_C to edit_status.json.
+    servers: vlm
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 1
+    steps:
+    - gate_2d
+
+  - name: trellis2_encode
+    desc: >
+      TRELLIS.2 P1: encode the ORIGINAL mesh → shape SLat reference
+      (p1_encode/shape_slat.npz). Required by the masked editing path
+      (use_mask: true) — it is the clean latent the inversion anchors
+      the preserved region to. Only needs mesh.npz, so it is chained
+      before trellis2_3d (claims GPUs after FLUX servers shut down).
+    servers: none
+    use_gpus: true
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 2
+    steps:
+    - trellis2_encode
+
+  - name: trellis2_preview
+    desc: >
+      TRELLIS.2 masked latent editing from the FLUX-edited 2D image
+      (use_mask: true): modification/scale edit SS structure + geometry
+      + material; material/color/global edit material only with geometry
+      locked. Inversion uses the ORIGINAL view, forward uses the edited
+      view. Chained AFTER flux_2d + gate_2d + trellis2_encode
+      (chain_id=flux_chain) so it can claim GPUs once FLUX/VLM servers shut
+      down, and only edits that passed Gate C reach it.
+      Output - edits_3d/<edit_id>/after.glb.
+      NOTE - preview_flux is not chained here because the v1 preview
+      renderer reads SLAT npz; rewriting it to read GLB is a separate
+      task. gate_quality (Gate E) will not have an "after" preview until
+      that is done — Gate C (gate_2d) is the active quality gate.
+    servers: none
+    use_gpus: true
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 3
+    steps:
+    - trellis2_3d
+
+  # preview_del is optional. It only matters if you plan to feed deletion
+  # edits into gate_quality. Enable explicitly via STAGES=...,preview_del,...
+  - name: preview_del
+    desc: Optional Blender 5-view preview of after_new.glb (deletion/addition
+      edits). Only needed when gate_quality runs on deletion edits.
+    servers: none
+    optional: true
+    steps:
+    - preview_del
+
+  # Gate E (gate_quality) is disabled for now — it needs an "after" 5-view
+  # preview that the v2 GLB output does not yet produce (see trellis2_preview
+  # NOTE). Quality is gated at the 2D stage by gate_2d (Gate C). To re-enable,
+  # add a `gate_quality` stage here once a GLB-based preview step exists.
+
+services:
+  vlm:
+    model: /path/to/vlm/model
+
+  image_edit:
+    enabled: true
+    image_edit_backend: local_diffusers
+    workers_per_server: 2
+
+    # ── TRELLIS.2 settings (consumed by trellis2_3d.py) ─────────────
+    trellis2_codebase: /mnt/zsn/3dobject/TRELLIS.2
+    trellis2_ckpt:     /mnt/zsn/ckpts/TRELLIS.2-4B
+
+    # Masked latent editing (Vinedresser3D-style): preserve outside the
+    # edited part, re-flow inside. This is the whole point of the v2
+    # migration — keep it on. When true, trellis2_3d uses the 1024
+    # (non-cascade) flow models directly so SS / shape / tex share one
+    # 64³ coord set, and REQUIRES the trellis2_encode stage to have run.
+    # Set false to fall back to naive full re-generation from the 2D edit.
+    use_mask: true
+
+    # pipeline_type only applies to the use_mask:false fallback.
+    # 512 / 1024 / 1024_cascade / 1536_cascade — 1024_cascade ≈ best
+    # speed/quality on H100.
+    trellis2_pipeline_type: 1024_cascade
+    trellis2_seed: 1
+    trellis2_num_samples: 1
+    trellis2_decimation_target: 1000000
+    trellis2_texture_size: 4096
+    # If false, skip the before.glb render (halves runtime, keeps after.glb).
+    emit_before: true
+
+    # Per-GPU concurrent TRELLIS.2 workers. v2 占显存比 v1 大,
+    # 24-40GB 卡建议 1；80GB H100/H800 可试 2。Env: TRELLIS_WORKERS_PER_GPU.
+    trellis_workers_per_gpu: 1
+
+qc:
+  thresholds_by_type:
+    deletion:
+      min_visual_quality: 3
+    modification:
+      min_visual_quality: 3
+      require_preserve_other: true
+    scale:
+      min_visual_quality: 3
+      require_preserve_other: true
+    material:
+      min_visual_quality: 3
+    color:
+      min_visual_quality: 3
+    global:
+      min_visual_quality: 3
+    addition:
+      min_visual_quality: 3

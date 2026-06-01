@@ -1,0 +1,164 @@
+# =====================================================================
+# Pipeline v3 — single-shard template
+# =====================================================================
+#
+# 怎么跑：
+#   1) 拷贝模板：
+#        cp configs/templates/pipeline_v3_bench.template.yaml \
+#           configs/my_run.yaml
+#      编辑 my_run.yaml 里的 paths / GPUs / 端口 / 服务模型。
+#   2) 准备机器 env：
+#        cp configs/machine/template.env configs/machine/$(hostname).env
+#      并改其中的 conda env / 数据根目录 / checkpoint 路径。
+#   3) 校验输入数据齐备：
+#        bash scripts/tools/validate_bench_inputs.sh configs/my_run.yaml
+#      (检查 mesh / images / slat 三套 NPZ 是否完整)
+#   4) 启动管线：
+#        bash scripts/tools/run_pipeline_v3_shard.sh configs/my_run.yaml
+#      (脚本自动 source configs/machine/$(hostname).env，
+#       根据 pipeline.gpus 拉起 VLM / FLUX 子进程，运行 stages)
+#   5) 监控：
+#        python scripts/tools/show_progress.py <output_dir>
+#        python scripts/tools/summarize_edit_status.py <output_dir>
+#
+# Stage 顺序：gen_edits → gate_text_align → (del_mesh ∥ flux_2d → trellis_3d
+#                                            → preview_flux ∥ preview_del)
+#             → gate_quality
+# 单一权威视角：每条 edit 的 2D 输入视角来自
+#   edit_status.json.edits.<id>.gates.A.vlm.best_view  (由 gate_text_align 写)
+#   缺失 → from_parsed_edit 抛 ValueError，不会用固定视角兜底。
+#
+# 单步运行（断点续跑或调试用）：
+#   bash scripts/tools/run_pipeline_v3_shard.sh configs/my_run.yaml \
+#       --steps gate_text_align,flux_2d
+#   --force 可重跑已 done 的 edit（仍尊重 gate_a prereq）。
+#
+# 重跑某类编辑：
+#   python scripts/tools/reset_v3_edits_by_type.py <output_dir> --type material
+#   再 rerun pipeline。
+# =====================================================================
+
+blender: /path/to/blender
+ckpt_root: /path/to/checkpoints
+
+data:
+  # Example:
+  # output_dir: /mnt/zsn/zsn_workspace/PartCraft3D/outputs/partverse/bench_shard08_test20/mode_e_text_align
+  output_dir: /path/to/outputs/partverse/<run_name>
+
+  # Bench inputs root split (required):
+  #   <inputs>/mesh/<shard>/<obj_id>.npz
+  #   <inputs>/images/<shard>/<obj_id>.npz
+  #   <inputs>/slat/<shard>/<obj_id>_{coords,feats}.pt
+  mesh_root: /path/to/bench/inputs/mesh
+  images_root: /path/to/bench/inputs/images
+  slat_dir: /path/to/bench/inputs/slat
+
+pipeline:
+  gpus: [0, 1, 2, 3]
+
+  # Service ports (one server per GPU unless overridden).
+  vlm_port_base: 8200
+  vlm_port_stride: 1
+  flux_port_base: 8020
+  flux_port_stride: 1
+
+  prerender_workers: 6
+  s6p_del_workers: 6
+
+  # Scheduler source of truth
+  stages:
+  - name: text_gen_gate_a
+    desc: VLM edit generation + text-align gate
+    servers: vlm
+    steps:
+    - gen_edits
+    - gate_text_align
+
+
+  - name: del_mesh
+    desc: Deletion mesh masking (CPU). Produces del_*/after_new.glb plus
+      add_*/meta.json — terminal for the deletion/addition data branch
+      (no rendering needed unless preview_del is opted in).
+    servers: none
+    parallel_group: edit_branches
+    steps:
+    - del_mesh
+
+  - name: flux_2d
+    desc: FLUX 2D image editing (modification / style / material / scale /
+      colour / global / addition).
+    servers: flux
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 0
+    steps:
+    - flux_2d
+
+  - name: trellis_preview
+    desc: Trellis 3D reconstruction + 5-view preview. Chained AFTER flux_2d
+      (chain_id=flux_chain) so Trellis can claim GPUs once FLUX servers
+      shut down. Runs in parallel with the del_mesh chain.
+    servers: none
+    use_gpus: true
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 1
+    steps:
+    - trellis_3d
+    - preview_flux
+
+  # preview_del is optional. It only matters if you plan to feed deletion
+  # edits into gate_quality. Enable explicitly via STAGES=...,preview_del,...
+  - name: preview_del
+    desc: Optional Blender 5-view preview of after_new.glb (deletion/addition
+      edits). Only needed when gate_quality runs on deletion edits.
+    servers: none
+    optional: true
+    steps:
+    - preview_del
+
+  - name: gate_quality
+    desc: VLM visual quality gate
+    servers: vlm
+    steps:
+    - gate_quality
+
+services:
+  vlm:
+    model: /path/to/vlm/model
+
+  image_edit:
+    enabled: true
+    trellis_text_ckpt: /path/to/TRELLIS-text-xlarge
+    image_edit_backend: local_diffusers
+    workers_per_server: 2
+    # Per-GPU concurrent Trellis 3D workers (1 = current behavior).
+    # Recommended: 2 on 80+ GB cards, 3 only on 144 GB H800. K > 1 helps
+    # because each worker overlaps its CPU/IO (DINOv2, voxel mask, NFS)
+    # with another worker's GPU sampling. Only trellis_3d honors this;
+    # preview_flux / render_3d ignore it. Env override:
+    # TRELLIS_WORKERS_PER_GPU=<n>.
+    trellis_workers_per_gpu: 1
+    export_ply: false
+    export_ply_for_deletion: false
+    repaint_mode: image
+
+qc:
+  thresholds_by_type:
+    deletion:
+      min_visual_quality: 3
+    modification:
+      min_visual_quality: 3
+      require_preserve_other: true
+    scale:
+      min_visual_quality: 3
+      require_preserve_other: true
+    material:
+      min_visual_quality: 3
+    color:
+      min_visual_quality: 3
+    global:
+      min_visual_quality: 3
+    addition:
+      min_visual_quality: 3
