@@ -1,0 +1,80 @@
+# =====================================================================
+# Pipeline v3 — flux-salvage template (single shard)
+# =====================================================================
+#
+# Re-runs flux_2d → trellis_preview → gate_quality on a shard whose
+# edits were previously cleared by:
+#   scripts/tools/reset_v3_edits_by_type.py <objs_root> \
+#       --edit-type modification --edit-type scale --edit-type material \
+#       --edit-type color --edit-type global \
+#       --clear-gate-e --only-not-passed --delete-artifacts --apply
+#
+# Driver: scripts/tools/run_salvage_local.sh substitutes the OUTPUT_DIR
+# placeholder below before invoking run_pipeline_v3_shard.sh.
+# =====================================================================
+
+blender: /usr/bin/false              # flux-salvage has no deletion / preview_del
+ckpt_root: /mnt/zsn/zsn_workspace/PartCraft3D/checkpoints
+
+data:
+  output_dir: <OUTPUT_DIR>           # filled per shard by the wrapper
+  mesh_root:   /mnt/zsn/zsn_workspace/PartCraft3D/data/partverse/inputs/mesh
+  images_root: /mnt/zsn/zsn_workspace/PartCraft3D/data/partverse/inputs/images
+  slat_dir:    /mnt/zsn/zsn_workspace/PartCraft3D/data/partverse/inputs/slat
+
+pipeline:
+  # Each GPU gets one FLUX server (flux_2d) / VLM server (gate_quality),
+  # and TRELLIS spreads across all of them in trellis_preview.
+  gpus: [0, 1, 2, 3, 4, 5, 6, 7]
+  vlm_port_base: 8200
+  vlm_port_stride: 1
+  flux_port_base: 8020
+  flux_port_stride: 1
+  prerender_workers: 4
+  s6p_del_workers: 4
+  gate_a_concurrency: 4
+  gate_a_per_obj_concurrency: 2
+
+  stages:
+    # flux_2d → trellis_3d → preview_flux as one chain, then gate_e.
+    - name: flux_2d
+      desc: FLUX 2D edit (mod / scl / mat / clr / glb)
+      servers: flux
+      chain_id: salvage_chain
+      chain_order: 0
+      steps: [flux_2d]
+
+    - name: trellis_preview
+      desc: TRELLIS 3D decode + 5-view GS preview
+      servers: none
+      use_gpus: true
+      chain_id: salvage_chain
+      chain_order: 1
+      steps: [trellis_3d, preview_flux]
+
+    - name: gate_quality
+      desc: Gate E (VLM visual QC)
+      servers: vlm
+      steps: [gate_quality]
+
+services:
+  vlm:
+    model: /mnt/zsn/ckpts/Qwen3.5-27B
+
+  image_edit:
+    enabled: true
+    trellis_text_ckpt: /mnt/zsn/zsn_workspace/PartCraft3D/checkpoints/TRELLIS-text-xlarge
+    image_edit_backend: local_diffusers
+    workers_per_server: 2
+    trellis_workers_per_gpu: 1
+    export_ply: false
+    export_ply_for_deletion: false
+    repaint_mode: image
+
+qc:
+  thresholds_by_type:
+    modification: { min_visual_quality: 3, require_preserve_other: true }
+    scale:        { min_visual_quality: 3, require_preserve_other: true }
+    material:     { min_visual_quality: 3 }
+    color:        { min_visual_quality: 3 }
+    global:       { min_visual_quality: 3 }

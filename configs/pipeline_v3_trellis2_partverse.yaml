@@ -1,0 +1,171 @@
+# =====================================================================
+# Pipeline v3 — TRELLIS.2 masked editing, PartVerse (concrete run config)
+# =====================================================================
+# Derived from configs/templates/pipeline_v3_trellis2.template.yaml with the
+# real paths for THIS box (L20×8). Run via the multi-GPU shard launcher:
+#
+#   MACHINE_ENV=configs/machine/local_trellis2.env \
+#     bash run_pipeline_v3_shard_trellis2.sh \
+#          shard08 configs/pipeline_v3_trellis2_partverse.yaml
+#
+# Single step / smoke (1 obj):
+#   OBJ_IDS_FILE=<ids.txt> SHARD=08 LIMIT=1 \
+#     bash run_pipeline_v3_shard_trellis2.sh \
+#          shard08_smoke configs/pipeline_v3_trellis2_partverse.yaml
+#
+# Stage order (DEFAULT_STAGES):
+#   text_gen_gate_a → flux_2d > gate_2d > trellis2_encode > trellis2_preview
+# Edit-type scope: qc.edit_types (below) currently = {modification, scale}.
+# del/add are intentionally OUT of the flow (no del_mesh stage). To add
+# material/color/global later, just extend qc.edit_types — no code change.
+# All paths are RELATIVE to the repo root (the launcher cd's there) and
+# resolve through the repo symlinks:
+#   data/partverse  -> /mnt/zsn/data/partverse        (inputs, read-only)
+#   data/Pxform_v2  -> /mnt/zsn/data/Pxform_v2        (outputs, this run)
+# =====================================================================
+
+# Blender 4.2.19 LTS (same build v1 used). gen_edits Mode A renders the
+# segmentation row of the VLM overview with this; del_mesh/preview_del too.
+blender: /mnt/zsn/zsn_workspace/VoxHammer/third_party/blender-4.2.19-linux-x64/blender
+ckpt_root: /mnt/zsn/ckpts/TRELLIS.2-4B
+
+data:
+  # Output root — pipeline writes objects/<shard>/<obj_id>/ + _global/ here.
+  # data/Pxform_v2 is a repo symlink to /mnt/zsn/data/Pxform_v2 (== /root/zsn/...).
+  output_dir: data/Pxform_v2
+
+  # PartVerse split inputs (already in bench format):
+  #   <root>/mesh/<shard>/<obj_id>.npz   <root>/images/<shard>/<obj_id>.npz
+  mesh_root:   data/partverse/inputs/mesh
+  images_root: data/partverse/inputs/images
+  # NOTE: no slat_dir — the TRELLIS.2 masked path re-encodes the mesh fresh
+  # (trellis2_encode → shape_slat.npz); it does not consume the v1 SLAT .pt.
+
+pipeline:
+  gpus: [0, 1, 2, 3, 4, 5, 6, 7]
+
+  # One server per GPU. Stride 1 → ports are contiguous per GPU index.
+  vlm_port_base: 8200
+  vlm_port_stride: 1
+  flux_port_base: 8020
+  flux_port_stride: 1
+
+  prerender_workers: 6
+  s6p_del_workers: 6
+
+  # Scheduler source of truth -----------------------------------------
+  stages:
+  - name: text_gen_gate_a
+    desc: VLM edit generation (Mode A overview) + text-align gate
+    servers: vlm
+    steps:
+    - gen_edits
+    - gate_text_align
+
+  - name: flux_2d
+    desc: FLUX 2D image editing. Scoped to qc.edit_types (now modification /
+      scale); material / color / global re-enable by extending qc.edit_types.
+    servers: flux
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 0
+    steps:
+    - flux_2d
+
+  - name: gate_2d
+    desc: >
+      Gate C — VLM judges each FLUX before→after pair against the instruction.
+      Runs after flux_2d, BEFORE the 3D edit, so a 2D edit that does not match
+      the prompt never reaches TRELLIS.2 (trellis2_3d is gated on gate_c==pass).
+    servers: vlm
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 1
+    steps:
+    - gate_2d
+
+  - name: trellis2_encode
+    desc: >
+      TRELLIS.2 P1 — encode the ORIGINAL mesh → shape SLat reference
+      (p1_encode/shape_slat.npz). The clean latent the masked inversion
+      anchors the preserved region to. GPU, no server.
+    servers: none
+    use_gpus: true
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 2
+    steps:
+    - trellis2_encode
+
+  - name: trellis2_preview
+    desc: >
+      TRELLIS.2 masked latent editing from the FLUX-edited 2D image.
+      modification/scale edit SS structure + geometry + material;
+      material/color/global edit material only with geometry locked.
+      Inversion uses the ORIGINAL view, forward uses the edited view.
+      Output - edits_3d/<edit_id>/after.glb (+ before.glb).
+    servers: none
+    use_gpus: true
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 3
+    steps:
+    - trellis2_3d
+
+services:
+  vlm:
+    # Must equal the sglang --model-path (the id it reports). The launcher
+    # starts servers from VLM_CKPT in the machine env — keep them identical.
+    model: /mnt/zsn/ckpts/Qwen3.6-27B
+
+  image_edit:
+    enabled: true
+    image_edit_backend: local_diffusers
+    workers_per_server: 2
+
+    # ── TRELLIS.2 settings (consumed by trellis2_3d.py) ─────────────
+    trellis2_codebase: /mnt/zsn/3dobject/TRELLIS.2
+    trellis2_ckpt:     /mnt/zsn/ckpts/TRELLIS.2-4B
+
+    # Masked latent editing (Vinedresser3D-style): preserve outside the
+    # edited part, re-flow inside. Forces the 1024 (non-cascade) flow models
+    # so SS/shape/tex share one 64³ coord set; REQUIRES trellis2_encode first.
+    use_mask: true
+
+    # Applies only to the use_mask:false fallback.
+    trellis2_pipeline_type: 1024_cascade
+    trellis2_seed: 1
+    trellis2_num_samples: 1
+    trellis2_decimation_target: 1000000
+    trellis2_texture_size: 4096
+    emit_before: true
+
+    # Per-GPU concurrent TRELLIS.2 workers. L20 (48GB): keep 1.
+    # Env override: TRELLIS_WORKERS_PER_GPU.
+    trellis_workers_per_gpu: 1
+
+qc:
+  # PROCESSING allow-list — which edit types reach flux_2d / gate_2d /
+  # trellis2_3d (via iter_flux_specs). Does NOT affect generation: gen_edits
+  # always produces the FULL quota (all types) ONCE. So enabling more types
+  # later = add them here + re-run flux_2d/trellis2 on the already-parsed
+  # edits — NO re-generation. TEMPORARY scope; omit this key → all types.
+  edit_types: [modification, scale]
+
+  thresholds_by_type:
+    deletion:
+      min_visual_quality: 3
+    modification:
+      min_visual_quality: 3
+      require_preserve_other: true
+    scale:
+      min_visual_quality: 3
+      require_preserve_other: true
+    material:
+      min_visual_quality: 3
+    color:
+      min_visual_quality: 3
+    global:
+      min_visual_quality: 3
+    addition:
+      min_visual_quality: 3

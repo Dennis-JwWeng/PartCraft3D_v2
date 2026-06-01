@@ -1,0 +1,219 @@
+"""Edit type definitions for PartCraft3D.
+
+Centralizes all edit type constants, metadata, and routing logic.
+Each edit type maps to a specific TRELLIS execution strategy.
+
+Taxonomy (from the 3D editing data design doc):
+  1.1 Topological Evolution   — deletion, addition, modification (swap)
+  1.2 Geometric Deformation   — scale (anisotropic part scaling)
+  1.3 Attribute Decoupling     — material (part-level texture), global (whole-object style)
+  1.5 Identity & Negatives     — identity (no-op, anti-hallucination)
+"""
+
+from __future__ import annotations
+
+import os
+
+
+# ---------------------------------------------------------------------------
+# Edit type constants
+# ---------------------------------------------------------------------------
+
+# 1.1 Topological Evolution
+DELETION = "deletion"          # Remove part(s) from object — GT mesh removal
+ADDITION = "addition"          # Add part(s) back — reverse of deletion
+MODIFICATION = "modification"  # Swap part shape — TRELLIS S1+S2 repaint
+
+# 1.2 Geometric Deformation
+SCALE = "scale"                # Anisotropic part scaling — TRELLIS S1+S2 repaint
+
+# 1.3 Attribute Decoupling
+MATERIAL = "material"          # Part-level material/texture change — S2 only
+COLOR = "color"                # Part-level colour change (hue/shade only) — S2 only
+GLOBAL = "global"              # Whole-object style/theme — S2 only (full mask)
+
+# 1.5 Identity & Negatives
+IDENTITY = "identity"          # No-op: input=output, irrelevant instruction
+
+ALL_TYPES = {DELETION, ADDITION, MODIFICATION, SCALE, MATERIAL, COLOR, GLOBAL, IDENTITY}
+
+# ---------------------------------------------------------------------------
+# Edit type → TRELLIS execution strategy
+# ---------------------------------------------------------------------------
+
+# Types that use TRELLIS Flow Inversion + S1+S2 repaint (geometry changes)
+S1_S2_TYPES = {MODIFICATION, SCALE}
+
+# Types that use TRELLIS S2 only (appearance changes, preserve geometry)
+S2_ONLY_TYPES = {MATERIAL, COLOR, GLOBAL}
+
+# Types that use GT mesh operations (no TRELLIS generation)
+MESH_ONLY_TYPES = {DELETION}
+
+# Types that need no generation at all
+NO_GEN_TYPES = {IDENTITY, ADDITION}
+
+# Types that need a part mask (not full 64³)
+PART_MASK_TYPES = {MODIFICATION, SCALE, MATERIAL, COLOR, DELETION}
+
+# Types that use full 64³ mask
+FULL_MASK_TYPES = {GLOBAL}
+
+# ---------------------------------------------------------------------------
+# Runtime PROCESSING allow-list — which edit types reach FLUX/TRELLIS.2
+# ---------------------------------------------------------------------------
+# Driven by the EDIT_GEN_TYPES env var (CSV), which run_trellis2 sets from the
+# run config's ``qc.edit_types``.  IMPORTANT: this gates only DOWNSTREAM
+# PROCESSING (specs.iter_flux_specs → flux_2d / gate_2d / trellis2_3d).  It does
+# NOT touch generation: gen_edits always emits the FULL quota (all types) once,
+# so enabling more types later needs NO re-generation — just extend
+# qc.edit_types and re-run flux_2d/trellis2 on the already-parsed edits.
+# Unset env (or config key omitted) → all types processed.
+def enabled_edit_types() -> set[str]:
+    raw = os.environ.get("EDIT_GEN_TYPES", "").strip()
+    if not raw:
+        return set(ALL_TYPES)
+    picked = {t.strip().lower() for t in raw.split(",") if t.strip()} & ALL_TYPES
+    return picked or set(ALL_TYPES)
+
+# ---------------------------------------------------------------------------
+# Edit ID prefixes
+# ---------------------------------------------------------------------------
+
+ID_PREFIX = {
+    DELETION: "del",
+    ADDITION: "add",
+    MODIFICATION: "mod",
+    SCALE: "scl",
+    MATERIAL: "mat",
+    COLOR: "clr",
+    GLOBAL: "glb",
+    IDENTITY: "idt",
+}
+
+# ---------------------------------------------------------------------------
+# TRELLIS effective type mapping
+# ---------------------------------------------------------------------------
+
+def trellis_effective_type(edit_type: str) -> str:
+    """Map PartCraft edit type → interweave_Trellis_TI edit_type string.
+
+    interweave_Trellis_TI understands: Modification, Addition, TextureOnly,
+    Deletion, HybridDeletion.  We map our higher-level types to these.
+    """
+    if edit_type in (MODIFICATION, SCALE):
+        return "Modification"
+    if edit_type in (MATERIAL, COLOR, GLOBAL):
+        return "TextureOnly"
+    if edit_type == DELETION:
+        return "Deletion"
+    if edit_type == ADDITION:
+        return "Addition"
+    return "Modification"  # fallback
+
+
+# ---------------------------------------------------------------------------
+# Processing order (for streaming pipeline)
+# ---------------------------------------------------------------------------
+
+TYPE_ORDER = {
+    DELETION: 0,
+    MODIFICATION: 1,
+    SCALE: 2,
+    MATERIAL: 3,
+    COLOR: 4,
+    GLOBAL: 5,
+    IDENTITY: 5,
+    # addition handled separately (after all deletions)
+}
+
+# ---------------------------------------------------------------------------
+# Pipeline routing (authoritative for pipeline_v2 step routing)
+# ---------------------------------------------------------------------------
+
+# Edit types that require a FLUX 2D edited image as conditioning input.
+# Single source of truth — imported by pipeline_v2.paths.
+FLUX_TYPES: frozenset[str] = frozenset({MODIFICATION, SCALE, MATERIAL, COLOR, GLOBAL})
+
+# Canonical edit_type → edit_id prefix.
+# Same content as ID_PREFIX; aliased so pipeline_v2.paths has one import point.
+EDIT_TYPE_PREFIX: dict[str, str] = ID_PREFIX
+
+# ---------------------------------------------------------------------------
+# Programmatic edit templates
+# ---------------------------------------------------------------------------
+
+# Scale edit templates: (prompt_template, before_template, after_template)
+# {part} is replaced with a natural-language part phrase (record ``desc`` or
+# humanized ``label``) in plan_edits_for_record.
+SCALE_TEMPLATES = [
+    ("Make the {part} taller",
+     "{part}", "taller {part}"),
+    ("Make the {part} shorter",
+     "{part}", "shorter compact {part}"),
+    ("Make the {part} wider",
+     "{part}", "wider {part}"),
+    ("Make the {part} thinner",
+     "{part}", "thinner slender {part}"),
+    ("Make the {part} larger",
+     "{part}", "larger {part}"),
+    ("Make the {part} smaller and more compact",
+     "{part}", "smaller compact {part}"),
+    ("Stretch the {part} longer",
+     "{part}", "elongated {part}"),
+    ("Make the {part} thicker and sturdier",
+     "{part}", "thicker sturdier {part}"),
+]
+
+# Material edit templates: (prompt_template, after_part_desc_template)
+# {part} is replaced with the same natural-language phrase as scale templates.
+MATERIAL_TEMPLATES = [
+    ("Change the {part} to wooden material",
+     "wooden {part}"),
+    ("Make the {part} metallic chrome",
+     "chrome metallic {part}"),
+    ("Change the {part} to glass material",
+     "transparent glass {part}"),
+    ("Make the {part} look like stone",
+     "stone carved {part}"),
+    ("Change the {part} to rusty iron",
+     "rusty corroded iron {part}"),
+    ("Make the {part} golden and polished",
+     "golden polished {part}"),
+    ("Change the {part} to matte black rubber",
+     "matte black rubber {part}"),
+    ("Make the {part} ceramic and glossy",
+     "glossy ceramic {part}"),
+]
+
+# Colour edit templates: (prompt_template, after_part_desc_template)
+COLOR_TEMPLATES = [
+    ("Change the {part} to a deep crimson red",
+     "deep crimson red {part}"),
+    ("Make the {part} matte charcoal black",
+     "matte charcoal black {part}"),
+    ("Change the {part} to a cobalt blue",
+     "cobalt blue {part}"),
+    ("Make the {part} ivory white",
+     "ivory white {part}"),
+    ("Change the {part} to a forest green",
+     "forest green {part}"),
+    ("Make the {part} warm amber orange",
+     "warm amber orange {part}"),
+    ("Change the {part} to a pale lavender",
+     "pale lavender {part}"),
+    ("Make the {part} glossy navy blue",
+     "glossy navy blue {part}"),
+]
+
+# Identity: irrelevant instructions (object should remain unchanged)
+IDENTITY_PROMPTS = [
+    "Make the sky brighter",
+    "Change the background color to blue",
+    "Add more sunlight to the scene",
+    "Rotate the camera angle slightly",
+    "Increase the ambient lighting",
+    "Make the shadows softer",
+    "Add a subtle glow effect",
+    "Adjust the white balance",
+]
