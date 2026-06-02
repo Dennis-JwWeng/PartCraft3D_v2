@@ -85,6 +85,42 @@ def main():
                     help="feather the S1 keep mask by N 16³ blocks (0=hard cut). "
                          "Softens the body↔edit boundary so the SS occupancy "
                          "doesn't tear at the junction.")
+    ap.add_argument("--contact-soft", action="store_true", default=False,
+                    help="S1-ONLY contact-aware distance-transform soft mask "
+                         "(dynamic sigma) at the structure stage. S2 is NOT "
+                         "touched — it keeps --s2-anchor-mode (default posthoc), "
+                         "because a per-step soft anchor on TRELLIS.2's S2 "
+                         "reintroduces the holey-shell/void regression.")
+    ap.add_argument("--subtract-preserved", choices=["auto", "on", "off"],
+                    default="auto",
+                    help="carve the S1 edit grid by other parts' voxels (v1 "
+                         "anti-inflation). auto = follow --contact-soft. Set "
+                         "'off' to isolate the pure S1 contact-mask effect.")
+    ap.add_argument("--s1-soft-sigma", type=float, default=None,
+                    help="override S1 contact-soft sigma (default: dynamic).")
+    ap.add_argument("--s2-soft-sigma", type=float, default=None,
+                    help="override S2 contact-soft sigma (default: dynamic).")
+    ap.add_argument("--s2-remove-small", type=int, default=0,
+                    help="drop coords_new components < N voxels (v1 used 50; "
+                         "0=off).")
+    ap.add_argument("--ss1-coords-dir", default=None,
+                    help="dir of TRELLIS.1-SS coords (from trellis1_ss_coords.py). "
+                         "When set, geometry edits use the cached "
+                         "<dir>/<obj>/<edit_id>/ss1_coords.npz as the SLat "
+                         "structure and run FREE S2 (bypasses TRELLIS.2 masked S1).")
+    ap.add_argument("--ss-vanilla", action="store_true", default=False,
+                    help="Exp control: geometry edits regenerate the WHOLE object "
+                         "with TRELLIS.2's OWN SS (vanilla, no mask) then free S2 — "
+                         "isolates 'vanilla vs masked' from 'TRELLIS.1 vs TRELLIS.2'.")
+    ap.add_argument("--ss-align-t1", action="store_true", default=False,
+                    help="Benchmark: run TRELLIS.2's masked S1 with TRELLIS.1's "
+                         "gentler SS sampler (steps25/cfg5/interval[.5,1]/rt3) "
+                         "instead of T2's default (steps12/cfg7.5). Tests whether "
+                         "the large-part robustness is the sampler, not the model.")
+    ap.add_argument("--ss-steps", type=int, default=0,
+                    help="override masked S1 SS sampler steps (0=default/preset).")
+    ap.add_argument("--ss-cfg", type=float, default=-1.0,
+                    help="override masked S1 SS guidance strength (<0=default).")
     ap.add_argument("--render", action="store_true", default=True)
     ap.add_argument("--no-render", dest="render", action="store_false")
     ap.add_argument("--export-glb", action="store_true", default=False,
@@ -133,18 +169,33 @@ def main():
         "trellis2_s1_pad": args.s1_pad,
         "trellis2_s1_keep_thresh": args.s1_thresh,
         "trellis2_s1_soft_feather": args.s1_soft_feather,
+        "trellis2_s1_contact_soft": args.contact_soft,
+        "trellis2_s1_soft_sigma": args.s1_soft_sigma,
+        "trellis2_s2_soft_sigma": args.s2_soft_sigma,
+        "trellis2_s2_remove_small": args.s2_remove_small,
+        "trellis2_mask_subtract_preserved": (
+            args.contact_soft if args.subtract_preserved == "auto"
+            else args.subtract_preserved == "on"),
         "trellis2_canonical_frame": args.canonical,
         "trellis2_s2_warmstart": args.s2_nn_init,
         "trellis2_s2_nn_init": args.s2_nn_init,
         "trellis2_s1_densify": args.s1_densify,
         "trellis2_s2_anchor_mode": args.s2_anchor_mode,
         "trellis2_s2_anchor_cutoff": args.s2_anchor_cutoff,
+        "trellis2_ss1_coords_dir": args.ss1_coords_dir,
+        "trellis2_ss_vanilla": args.ss_vanilla,
+        "trellis2_ss_align_t1": args.ss_align_t1,
+        "trellis2_ss_steps": args.ss_steps,
+        "trellis2_ss_cfg": (args.ss_cfg if args.ss_cfg >= 0 else None),
         "trellis2_texture_size": args.texture_size,
         "trellis2_decimation_target": args.decimation_target,
     }
-    log.info("config: canonical=%s anchor_mode=%s nn_init=%s s1_densify=%d "
-             "s1_pad=%d thresh=%.2f", args.canonical, args.s2_anchor_mode,
-             args.s2_nn_init, args.s1_densify, args.s1_pad, args.s1_thresh)
+    log.info("config: canonical=%s s2_anchor=%s nn_init=%s s1_densify=%d "
+             "s1_pad=%d thresh=%.2f s1_contact_soft=%s subtract_pres=%s "
+             "remove_small=%d",
+             args.canonical, args.s2_anchor_mode,
+             args.s2_nn_init, args.s1_densify, args.s1_pad, args.s1_thresh,
+             args.contact_soft, args.subtract_preserved, args.s2_remove_small)
 
     pipeline = T._ensure_pipeline(p25_cfg, log)
     enc = None

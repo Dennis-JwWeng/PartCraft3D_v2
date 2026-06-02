@@ -71,6 +71,9 @@ def edit_structure(
     logger,
     keep_thresh: float = 0.1,
     soft_feather: float = 0.0,
+    contact_mask: torch.Tensor | None = None,
+    contact_sigma: float | None = None,
+    ss_param_override: dict | None = None,
 ) -> torch.Tensor:
     """Masked-edit the sparse structure; return ``coords_new`` ``[M,3]`` int (0..63).
 
@@ -88,12 +91,20 @@ def edit_structure(
     dev = "cuda"
     ss_flow = pipeline.models["sparse_structure_flow_model"]
     ss_dec = pipeline.models["sparse_structure_decoder"]
-    params = pipeline.sparse_structure_sampler_params
+    # SS sampler params: ckpt default (steps12/cfg7.5/interval[.6,1]/rt5),
+    # optionally overridden — e.g. to benchmark against TRELLIS.1's gentler
+    # schedule (steps25/cfg5/interval[.5,1]/rt3), which is far more robust to
+    # collapse on LARGE edit regions.
+    params = {**pipeline.sparse_structure_sampler_params, **(ss_param_override or {})}
     gi = params.get("guidance_interval", (0.0, 1.0))
     grescale = params.get("guidance_rescale", 0.0)
     steps = int(params["steps"])
     rescale_t = float(params.get("rescale_t", 1.0))
     gs_fwd = float(params.get("guidance_strength", 7.5))
+    if ss_param_override:
+        logger.info("[s5/S1] SS sampler override: steps=%d cfg=%.1f "
+                    "interval=%s rt=%.1f grescale=%.2f", steps, gs_fwd, gi,
+                    rescale_t, grescale)
 
     # occupancy [1,1,64,64,64] from the original active voxels.
     # Feed fp32 (matches data_toolkit/encode_ss_latent.py) so the SS latent is
@@ -115,7 +126,21 @@ def edit_structure(
     # 16³ preserve mask (downsampled ×4 from the 64³ edit region).  Hard =
     # bool (True outside edit, torch.where replace); soft = float keep-weight
     # in [0,1] feathered across the boundary (blend) to heal the junction seam.
-    if soft_feather > 0:
+    if contact_mask is not None:
+        # v1-faithful: contact-aware distance-transform soft mask.  Decay is
+        # measured from the contact boundary (edit↔preserved interface) with the
+        # dynamic sigma from compute_contact_boundary, so blocks far from any
+        # contact stay fully anchored and the junction feathers exactly where
+        # the edit meets preserved geometry (mirrors interweave get_s1_soft_mask).
+        from .trellis2_contact_mask import get_s1_soft_mask
+        sigma = float(contact_sigma) if contact_sigma is not None else 3.0
+        keep16 = get_s1_soft_mask(
+            edit_grid64, sigma=sigma, contact_mask=contact_mask
+        ).to(dev)[None, None]
+        logger.info("[s5/S1] contact-soft boundary: sigma=%.2f, "
+                    "keep-weight range [%.2f, %.2f]", sigma,
+                    float(keep16.min()), float(keep16.max()))
+    elif soft_feather > 0:
         keep16 = edit_grid_64_to_keep16_soft(
             edit_grid64, thresh=keep_thresh, feather=soft_feather
         ).to(dev)[None, None]

@@ -359,6 +359,18 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
     # canonical Z-up encode/mask frame (must match the P1 encode's flag)
     canonical = bool(p25_cfg.get("trellis2_canonical_frame", False))
 
+    # ── v1-faithful contact-aware soft-mask path (one master switch) ──────
+    # When ``trellis2_s1_contact_soft`` is on we reproduce the TRELLIS.1
+    # interweave recipe: contact-aware distance-transform soft masks at S1 & S2
+    # with a dynamic sigma, preserved-part subtraction, and small-component
+    # cleanup.  Off → legacy hard/box-blur behaviour (unchanged).
+    contact_soft = bool(p25_cfg.get("trellis2_s1_contact_soft", False))
+    contact_64 = None
+    s2_sigma_eff = None
+    # default S2 anchor from config; the structure path overrides to
+    # "contact_soft" when the master switch is on (S2-only edits keep config).
+    s2_anchor = str(p25_cfg.get("trellis2_s2_anchor_mode", "perstep"))
+
     # ── conditioning: original (inversion) vs edited (forward) ────────
     orig_proc = pipeline.preprocess_image(orig_img)
     edit_proc = pipeline.preprocess_image(edited_img)
@@ -368,23 +380,102 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
     # original shape latent (raw/denormalized) — reused as geometry reference
     shape0 = t2e.sparse_denorm_shape(pipeline, p1_feats, coords0)
 
-    if edit_type in S1_S2_TYPES and target_part_ids:
+    # ── TRELLIS.1-SS bridge (optional) ────────────────────────────────────
+    # Use externally-generated TRELLIS.1 occupancy (scripts/standalone/
+    # trellis1_ss_coords.py, run in the vinedresser3d env) as the SLat
+    # structure and run FREE (vanilla) S2 shape+tex on it — bypasses TRELLIS.2's
+    # masked S1 entirely.  Tests whether TRELLIS.1's SS flow gives cleaner
+    # geometry than TRELLIS.2's masked S1 (which over-inflates the edit region).
+    ss1_dir = p25_cfg.get("trellis2_ss1_coords_dir", None)
+    ss1_npz = None
+    if ss1_dir:
+        cand = Path(ss1_dir) / spec.obj_id / spec.edit_id / "ss1_coords.npz"
+        if cand.is_file():
+            ss1_npz = cand
+
+    if ss1_npz is not None and edit_type in S1_S2_TYPES:
+        import numpy as np
+        coords_new = torch.from_numpy(
+            np.load(ss1_npz, allow_pickle=True)["coords"].astype("int64")
+        ).int().to(dev)
+        edit_grid = torch.ones(64, 64, 64, dtype=torch.bool, device=dev)
+        s2_anchor = "free"
+        logger.info("[s5/P4] %s TRELLIS.1-SS bridge: %d voxels → free S2",
+                    spec.edit_id, coords_new.shape[0])
+        shape_new = t2e.masked_shape_slat(
+            pipeline, sampler, p1_feats, coords0, coords_new, edit_grid,
+            cond_orig_1024, cond_edit_1024, logger,
+            warmstart=False, nn_init=False, anchor_mode="free")
+    elif p25_cfg.get("trellis2_ss_vanilla", False) and edit_type in S1_S2_TYPES:
+        # Exp 2: TRELLIS.2's OWN SS flow in VANILLA whole-object mode (no mask),
+        # then free S2 — the control that isolates "vanilla vs masked" (mechanism)
+        # from "TRELLIS.1 vs TRELLIS.2" (model).  SS uses the 512-res edited cond.
+        cond_edit_512 = pipeline.get_cond([edit_proc], 512)
+        cn = pipeline.sample_sparse_structure(
+            cond_edit_512, 64, num_samples=1)
+        coords_new = (cn[:, 1:] if cn.shape[1] == 4 else cn).int().to(dev)
+        edit_grid = torch.ones(64, 64, 64, dtype=torch.bool, device=dev)
+        s2_anchor = "free"
+        logger.info("[s5/P4] %s TRELLIS.2-vanilla-SS: %d voxels → free S2",
+                    spec.edit_id, coords_new.shape[0])
+        shape_new = t2e.masked_shape_slat(
+            pipeline, sampler, p1_feats, coords0, coords_new, edit_grid,
+            cond_orig_1024, cond_edit_1024, logger,
+            warmstart=False, nn_init=False, anchor_mode="free")
+    elif edit_type in S1_S2_TYPES and target_part_ids:
         # ── S1: edit structure → coords_new ───────────────────────────
         # Edit-region tightness knobs (the S1 SS latent is only 16³, so an
         # over-dilated / low-threshold region engulfs the whole part zone and
         # the structure repaint returns a coarse blob — see maskviz diag).
         s1_pad = int(p25_cfg.get("trellis2_s1_pad", 3))
         s1_thresh = float(p25_cfg.get("trellis2_s1_keep_thresh", 0.1))
-        edit_grid = part_edit_grid_64(mesh_npz_path, target_part_ids,
-                                      pad=s1_pad, canonical=canonical).to(dev)
+        sub_pres = bool(p25_cfg.get("trellis2_mask_subtract_preserved",
+                                    contact_soft))
+        edit_grid = part_edit_grid_64(
+            mesh_npz_path, target_part_ids, pad=s1_pad, canonical=canonical,
+            subtract_preserved=sub_pres).to(dev)
+        # contact analysis (shared by S1 + S2) — dynamic blend sigma from how
+        # much the edit surface touches preserved geometry (v1 recipe).
+        s1_sigma_eff = None
+        if contact_soft:
+            from partcraft.pipeline_v3.trellis2_contact_mask import (
+                compute_contact_boundary)
+            contact_64, c_ratio, s1_dyn, s2_dyn = compute_contact_boundary(
+                edit_grid, coords0, dev)
+            s1_cfg = p25_cfg.get("trellis2_s1_soft_sigma", None)
+            s1_sigma_eff = float(s1_cfg) if s1_cfg is not None else s1_dyn
+            # S2 deliberately does NOT use the contact soft mask.  A per-step
+            # (even soft) anchor on TRELLIS.2's S2 makes the edit-region shell
+            # holey/see-through (the void/破碎 regression) — exactly what posthoc
+            # was built to avoid.  So contact-soft is now an S1-ONLY structure
+            # trick; S2 keeps the configured anchor (default posthoc = free gen
+            # + body paste), which stays the validated solid path.
+            s2_sigma_eff = None
+            logger.info("[s5/P4] %s contact ratio=%.2f → s1_sigma=%.2f "
+                        "(S1 contact mask only; S2 anchor=%s)",
+                        spec.edit_id, c_ratio, s1_sigma_eff, s2_anchor)
         cond_orig_512 = pipeline.get_cond([orig_proc], 512)
         cond_edit_512 = pipeline.get_cond([edit_proc], 512)
         ss_enc = t2s.get_ss_encoder(pipeline, p25_cfg, logger)
+        # SS sampler override — benchmark T2's own masked SS against TRELLIS.1's
+        # gentler schedule (the robustness win on large parts may be the sampler,
+        # not the model → would remove the cross-env bridge entirely).
+        ss_override = {}
+        if p25_cfg.get("trellis2_ss_align_t1", False):
+            ss_override = {"steps": 25, "guidance_strength": 5.0,
+                           "guidance_interval": [0.5, 1.0], "rescale_t": 3.0,
+                           "guidance_rescale": 0.0}
+        if p25_cfg.get("trellis2_ss_steps"):
+            ss_override["steps"] = int(p25_cfg["trellis2_ss_steps"])
+        if p25_cfg.get("trellis2_ss_cfg") is not None:
+            ss_override["guidance_strength"] = float(p25_cfg["trellis2_ss_cfg"])
         coords_new = t2s.edit_structure(
             pipeline, ss_enc, sampler, coords0, edit_grid,
             cond_orig_512, cond_edit_512, logger,
             keep_thresh=s1_thresh,
-            soft_feather=float(p25_cfg.get("trellis2_s1_soft_feather", 0.0))
+            soft_feather=float(p25_cfg.get("trellis2_s1_soft_feather", 0.0)),
+            contact_mask=contact_64, contact_sigma=s1_sigma_eff,
+            ss_param_override=(ss_override or None),
             ).to(dev)
         logger.info("[s5/P4] %s S1 structure: %d → %d voxels (parts=%s)",
                     spec.edit_id, coords0.shape[0], coords_new.shape[0],
@@ -400,14 +491,29 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
                 coords_new, edit_grid, iters=s1_densify).to(dev)
             logger.info("[s5/P4] %s S1 densify(iters=%d): %d → %d voxels",
                         spec.edit_id, s1_densify, n_before, coords_new.shape[0])
+        # ── drop floating specks (v1 remove_small_components) ─────────────
+        # Applied to the FULL occupancy (safer than v1's edit-only split: can't
+        # sever a small grown part still attached to the body) with v1's size.
+        s2_remove_small = int(p25_cfg.get("trellis2_s2_remove_small", 0))
+        if s2_remove_small > 0:
+            from partcraft.pipeline_v3.trellis2_contact_mask import (
+                remove_small_components)
+            keep = remove_small_components(
+                coords_new, min_size=s2_remove_small).to(coords_new.device)
+            n_before = coords_new.shape[0]
+            coords_new = coords_new[keep]
+            logger.info("[s5/P4] %s remove_small(<%d vox): %d → %d voxels",
+                        spec.edit_id, s2_remove_small, n_before,
+                        coords_new.shape[0])
         # ── S2 geometry on coords_new ─────────────────────────────────
         shape_new = t2e.masked_shape_slat(
             pipeline, sampler, p1_feats, coords0, coords_new, edit_grid,
             cond_orig_1024, cond_edit_1024, logger,
             warmstart=bool(p25_cfg.get("trellis2_s2_warmstart", False)),
             nn_init=bool(p25_cfg.get("trellis2_s2_nn_init", False)),
-            anchor_mode=str(p25_cfg.get("trellis2_s2_anchor_mode", "perstep")),
-            anchor_cutoff=float(p25_cfg.get("trellis2_s2_anchor_cutoff", 0.3)))
+            anchor_mode=s2_anchor,
+            anchor_cutoff=float(p25_cfg.get("trellis2_s2_anchor_cutoff", 0.3)),
+            contact_mask=contact_64, contact_sigma=s2_sigma_eff)
     else:
         # ── material / color / global: geometry preserved, coords fixed ──
         coords_new = coords0
@@ -433,7 +539,8 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
         tex_new = t2e.masked_tex_slat(
             pipeline, sampler, shape0, shape_new, coords0, coords_new,
             edit_grid, cond_orig_1024, cond_edit_1024, logger,
-            anchor_mode=str(p25_cfg.get("trellis2_s2_anchor_mode", "perstep")))
+            anchor_mode=s2_anchor,
+            contact_mask=contact_64, contact_sigma=s2_sigma_eff)
         torch.cuda.empty_cache()
         meshes = pipeline.decode_latent(shape_new, tex_new, 1024)
         mesh = meshes[0]

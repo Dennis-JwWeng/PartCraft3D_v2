@@ -419,6 +419,7 @@ def make_bridged_anchor_callback(
     preserved_mask: torch.Tensor,
     src_index: torch.Tensor,
     *,
+    soft_w: Optional[torch.Tensor] = None,
     schedule: str = "all",
     cutoff_t: float = 0.0,
     tol: float = 1e-4,
@@ -439,11 +440,20 @@ def make_bridged_anchor_callback(
         src_index:      long ``[P]`` where ``P == preserved_mask.sum()``; row in
                         the trajectory tensors (coords_orig order) feeding each
                         preserved token, in coords_new order.
+        soft_w:         optional float ``[P]`` per-preserved-token blend weight
+                        (v1 ``get_s2_soft_mask`` semantics): ``1`` = let the
+                        generation through (near the contact boundary → heals
+                        the seam), ``0`` = fully anchor to the inverted original
+                        (far from contact → exact preserve).  ``None`` = hard
+                        overwrite (the legacy behaviour).
 
-    At step ``t_prev``:
+    At step ``t_prev`` (hard):
         ``sample.feats[preserved_mask] = inverse_traj[t_prev].feats[src_index]``
+    (soft):
+        ``feats[pres] = gen[pres]·soft_w + inverse_traj[t_prev][src_index]·(1-soft_w)``
     """
     keys_sorted = sorted(inverse_traj.keys())
+    soft_col = soft_w.unsqueeze(1) if soft_w is not None else None  # [P,1]
 
     def _lookup(t_prev: float):
         key = round(float(t_prev), 6)
@@ -459,7 +469,12 @@ def make_bridged_anchor_callback(
         if ref is None:
             return None
         new_feats = sample.feats.clone()
-        new_feats[preserved_mask] = ref.feats[src_index]
+        anchor = ref.feats[src_index]
+        if soft_col is None:
+            new_feats[preserved_mask] = anchor
+        else:
+            gen = new_feats[preserved_mask]
+            new_feats[preserved_mask] = gen * soft_col + anchor * (1.0 - soft_col)
         return sample.replace(new_feats)
 
     return _cb
