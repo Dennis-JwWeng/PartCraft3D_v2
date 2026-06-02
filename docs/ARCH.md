@@ -66,7 +66,7 @@ data/Pxform_v2/
 | Pipeline conda env | `trellis2` (`/mnt/zsn/miniconda3/envs/trellis2`) — TRELLIS.2 codebase 依赖 (o_voxel/sparse/diffusers/nvdiffrast) |
 | Server conda env | `pipeline_server` — SGLang VLM + FLUX image-edit server |
 | VLM | SGLang × Qwen3.6-27B (`/mnt/zsn/ckpts/Qwen3.6-27B`),多模态,端口 8200+ |
-| FLUX | `scripts/tools/image_edit_server.py` × `FLUX.1-Kontext-dev`,端口 8020+ |
+| FLUX | `scripts/serve/image_edit_server.py` × `FLUX.2-klein-9B`,端口 8020+ |
 | TRELLIS.2 | codebase `/mnt/zsn/3dobject/TRELLIS.2`,ckpt `/mnt/zsn/ckpts/TRELLIS.2-4B` |
 | Blender | 4.2.19 LTS (`.../VoxHammer/third_party/blender-4.2.19-linux-x64/blender`) |
 | GPU | L20 × 8 |

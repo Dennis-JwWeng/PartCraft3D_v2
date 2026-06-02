@@ -343,9 +343,13 @@ def _render_overview_worker(args: tuple) -> tuple[str, str, str]:
         return obj_id, "skip", ""
     try:
         from partcraft.pipeline_v3.vlm_core import render_overview_png  # noqa: E402
-        png = render_overview_png(_P(mesh_npz), _P(image_npz), blender)
         out_p.parent.mkdir(parents=True, exist_ok=True)
-        # write atomically so a crash mid-Blender never leaves a torn file
+        # o-voxel overview (no Blender, no input images); save the camera record
+        # next to overview.png so downstream keeps the per-view viewpoint info.
+        png = render_overview_png(
+            _P(mesh_npz), _P(image_npz), blender,
+            save_viewpoints=out_p.parent / "viewpoints.json")
+        # write atomically so a crash mid-render never leaves a torn file
         tmp = out_p.with_suffix(".png.tmp")
         tmp.write_bytes(png)
         tmp.replace(out_p)

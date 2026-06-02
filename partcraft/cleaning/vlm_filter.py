@@ -3,7 +3,7 @@
 This module is a pure **library** (no main, no batch runner).  The previous
 ``run_vlm_filter`` / ``evaluate_edit`` / mesh-prefilter / PLY-render entries
 have been removed; the active entry point for VLM cleaning is
-``scripts/tools/run_vlm_cleaning.py`` (object-centric ``partverse_pairs/``
+``scripts/cleaning/run_vlm_cleaning.py`` (object-centric ``partverse_pairs/``
 layout, decoupled render + score, multi-GPU launcher).
 
 Public API:

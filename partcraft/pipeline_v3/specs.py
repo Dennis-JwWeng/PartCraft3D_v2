@@ -21,7 +21,7 @@ Numbering rules
 The ``EditSpec`` dataclass intentionally carries only fields that step
 runners actually need; full edit metadata stays in ``meta.json`` and
 ``parsed.json``. ``to_legacy_dict`` produces the dict consumed by
-``scripts.run_2d_edit.process_one`` so we can keep using the existing
+``partcraft.pipeline_v3.edit_2d.process_one`` so we can keep using the existing
 FLUX worker untouched.
 """
 from __future__ import annotations
@@ -33,6 +33,7 @@ from typing import Any, Iterable, Iterator
 
 from .paths import EDIT_TYPE_PREFIX, FLUX_TYPES, ObjectContext
 from .vlm_core import VIEW_INDICES  # single source of truth; defined in vlm_core.py
+from partcraft.render.ovox_views import VIEW_ORDER  # column → named camera
 
 
 @dataclass
@@ -43,8 +44,9 @@ class EditSpec:
     obj_id: str
     shard: str
     edit_idx: int           # index inside parsed.edits (stable)
-    view_index: int         # 0..4 (phase1_v2 short index)
-    npz_view: int           # absolute frame index into images npz
+    view_index: int         # 0..4 — overview column == named-view index
+    npz_view: int           # legacy absolute frame index (packed npz); unused by o-voxel
+    view_name: str = ""     # named camera (VIEW_ORDER[view_index]); o-voxel render target
     selected_part_ids: list[int] = field(default_factory=list)
     part_labels: list[str] = field(default_factory=list)
     prompt: str = ""
@@ -96,6 +98,7 @@ class EditSpec:
             )
         vi = int(gate_a_best_view)
         npz_view = VIEW_INDICES[vi]
+        view_name = VIEW_ORDER[vi]
         pids = list(edit.get("selected_part_ids") or [])
         labels = [parts_by_id.get(p, {}).get("name", "") for p in pids]
         return cls(
@@ -106,6 +109,7 @@ class EditSpec:
             edit_idx=edit_idx,
             view_index=vi,
             npz_view=npz_view,
+            view_name=view_name,
             selected_part_ids=pids,
             part_labels=labels,
             prompt=edit.get("prompt") or "",
@@ -135,7 +139,7 @@ class EditSpec:
     # ─── interop ─────────────────────────────────────────────────────
 
     def to_legacy_dict(self) -> dict[str, Any]:
-        """Produce the dict shape expected by ``scripts.run_2d_edit.process_one``.
+        """Produce the dict shape expected by ``partcraft.pipeline_v3.edit_2d.process_one``.
 
         Field semantics are inherited from the legacy pipeline; we only
         populate what FLUX backends actually consume.

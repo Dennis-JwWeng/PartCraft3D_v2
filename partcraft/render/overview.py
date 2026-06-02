@@ -4,11 +4,8 @@ Provides the 5x2 grid image that the VLM sees during Phase 1 (top row =
 original photos, bottom row = palette-colored part renders).
 
 Previously lived in ``scripts/tools/render_part_overview.py`` as a
-standalone script.  Moved here so pipeline_v2 modules can import cleanly
-without ``sys.path`` manipulation.
-
-``scripts/tools/render_part_overview.py`` is kept as a thin shim + CLI
-entry point that re-exports everything from this module.
+standalone script.  Moved here so pipeline_v3 modules can import cleanly
+without ``sys.path`` manipulation (the old CLI shim has been removed).
 """
 from __future__ import annotations
 
@@ -23,7 +20,7 @@ import cv2
 import numpy as np
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_BLENDER_SCRIPT = _PROJECT_ROOT / "scripts" / "blender_render_parts.py"
+_BLENDER_SCRIPT = _PROJECT_ROOT / "scripts" / "blender" / "blender_render_parts.py"
 
 # Fixed 5 view indices from the saved 150-view set:
 #   89  back-left  overhead   (yaw -143 deg, pitch -27 deg)
@@ -31,7 +28,6 @@ _BLENDER_SCRIPT = _PROJECT_ROOT / "scripts" / "blender_render_parts.py"
 #   91  front-left overhead   (yaw  -53 deg, pitch -28 deg)
 #   100 front-right overhead  (yaw  +53 deg, pitch -34 deg)
 #   8   front upward          (yaw  +22 deg, pitch +52 deg)
-# Changing this list requires updating scripts/tools/render_part_overview.py in lockstep.
 VIEW_INDICES = [89, 90, 91, 100, 8]
 
 # 16 named colors VLMs reliably distinguish & name. part_<i> gets _PALETTE[i % 16].

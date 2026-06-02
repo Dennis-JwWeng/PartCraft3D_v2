@@ -24,13 +24,9 @@
 #   缺失 → from_parsed_edit 抛 ValueError，不会用固定视角兜底。
 #
 # 单步运行（断点续跑或调试用）：
-#   bash scripts/tools/run_pipeline_v3_shard.sh configs/my_run.yaml \
+#   bash run_pipeline_v3_shard_trellis2.sh <tag> configs/my_run.yaml \
 #       --steps gate_text_align,flux_2d
 #   --force 可重跑已 done 的 edit（仍尊重 gate_a prereq）。
-#
-# 重跑某类编辑：
-#   python scripts/tools/reset_v3_edits_by_type.py <output_dir> --type material
-#   再 rerun pipeline。
 # =====================================================================
 
 blender: /path/to/blender

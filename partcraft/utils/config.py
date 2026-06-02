@@ -110,7 +110,7 @@ def _apply_data_roots_and_layout(cfg: dict) -> None:
       ``slat_dir``, ``img_enc_dir`` from ``data_dir`` only for keys that are missing
       or explicitly null/empty in YAML (so you can still override a single path).
 
-    Offline dataset scripts under ``scripts/datasets/partverse/`` continue to use
+    Offline dataset scripts under ``scripts/data_prep/partverse/`` continue to use
     ``PARTVERSE_DATA_ROOT`` / ``--data-root``; set it to the same path as ``data_dir``.
     """
     data = cfg.setdefault("data", {})

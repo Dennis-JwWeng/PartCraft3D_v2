@@ -809,7 +809,7 @@ class TrellisRefiner:
         """
         from trellis.utils import render_utils
 
-        # ---- 1. Check pre-generated single image (from run_2d_edit.py) ----
+        # ---- 1. Check pre-generated single image (from partcraft.pipeline_v3.edit_2d) ----
         if edit_dir:
             pre_dir = self.cache_dir / edit_dir
             pre_edited = pre_dir / f"{edit_id}_edited.png"

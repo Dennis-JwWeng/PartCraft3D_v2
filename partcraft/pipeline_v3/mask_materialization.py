@@ -5,8 +5,7 @@ from the heavy TRELLIS/Open3D runtime. Unit tests can use ``FakeBoxMaskBuilder``
 production callers can pass a builder that reproduces ``TrellisRefiner.build_part_mask``.
 
 :class:`PartCraftRuntimeMaskBuilder.build_mask_detail` additionally materializes
-per-SLAT preserve flags; pass ``include_slat_indices=True`` to :func:`materialize_masks`
-or use ``scripts/tools/dump_edit_part_mask.py`` for one-off dumps.
+per-SLAT preserve flags; pass ``include_slat_indices=True`` to :func:`materialize_masks`.
 """
 from __future__ import annotations
 

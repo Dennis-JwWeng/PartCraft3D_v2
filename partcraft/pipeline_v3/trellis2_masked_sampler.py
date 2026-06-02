@@ -97,6 +97,38 @@ def forward_diffuse_flow(
     return (1 - t) * x_0 + sig * eps
 
 
+def _randn_like_x(x: Any, generator: Optional[torch.Generator] = None) -> Any:
+    """Standard-normal noise matching ``x`` (dense Tensor or ``SparseTensor``).
+
+    Unlike ``torch.randn_like`` this threads an optional ``generator`` so the
+    FlowEdit per-step noise is reproducible (and so the SAME ``eps`` can be
+    shared by the source / target branches within a step).
+    """
+    if hasattr(x, "feats"):                       # SparseTensor
+        feats = torch.empty_like(x.feats)
+        feats.normal_(generator=generator) if generator is not None else feats.normal_()
+        return x.replace(feats)
+    e = torch.empty_like(x)
+    e.normal_(generator=generator) if generator is not None else e.normal_()
+    return e
+
+
+def _pin_to(z_edit: Any, x_src: Any, keep_mask: torch.Tensor) -> Any:
+    """Hard-restore ``z_edit`` to ``x_src`` wherever ``keep_mask`` is True.
+
+    The masked-FlowEdit safety net: FlowEdit drives the edit region while the
+    preserved region is pinned to the clean source latent.  ``keep_mask`` is a
+    bool tensor broadcastable to the dense latent (e.g. ``[D,H,W]`` for the
+    ``[B,C,D,H,W]`` SS latent) or shaped ``[N_tokens]`` for a SparseTensor.
+    Pure FlowEdit passes ``keep_mask=None`` and never calls this.
+    """
+    if hasattr(z_edit, "feats"):                  # SparseTensor
+        new_feats = torch.where(
+            keep_mask.unsqueeze(1), x_src.feats, z_edit.feats)
+        return z_edit.replace(new_feats)
+    return torch.where(keep_mask, x_src, z_edit)
+
+
 # ── core: callback-hook sampler ──────────────────────────────────────
 
 class MaskedFlowEulerSampler(FlowEulerSampler):
@@ -165,6 +197,104 @@ class MaskedFlowEulerSampler(FlowEulerSampler):
                                   cond=cond, **kwargs)
             traj[round(float(t_prev), 6)] = sample
         return traj
+
+    # ─────────────── FlowEdit ODE (no inversion, no mask) ────────────
+    # Drives a clean SOURCE latent toward an edited TARGET purely by the
+    # guided-velocity DIFFERENCE of a source branch (original condition) and a
+    # target branch (edited condition), per FlowEdit.  Replaces the
+    # inversion + masked-repaint recipe: non-edit regions stay put because the
+    # two branches predict (near-)identical velocity there, so no explicit keep
+    # mask is required.  Works for dense tensors (SS latent) and SparseTensors.
+
+    @torch.no_grad()
+    def flowedit_sample(
+        self,
+        model,
+        x_src,
+        cond_src,
+        cond_tgt,
+        neg_cond,
+        *,
+        steps: int = 25,
+        rescale_t: float = 1.0,
+        guidance_strength_src: float = 3.0,
+        guidance_strength_tgt: float = 7.5,
+        guidance_interval: Tuple[float, float] = (0.0, 1.0),
+        guidance_rescale: float = 0.0,
+        n_avg: int = 1,
+        keep_mask: Optional[torch.Tensor] = None,
+        seed: Optional[int] = None,
+        verbose: bool = True,
+        tqdm_desc: str = "FlowEdit",
+        **kwargs,
+    ):
+        """Integrate the FlowEdit ODE and return the edited latent ``z_edit``.
+
+        Args:
+            x_src:      clean SOURCE latent (Tensor or SparseTensor).  z_edit is
+                        seeded from this and stays here in non-edit regions.
+            cond_src:   conditioning for the source branch (ORIGINAL image).
+            cond_tgt:   conditioning for the target branch (EDITED image).
+            neg_cond:   shared null/unconditional embedding for both branches.
+            guidance_strength_src/tgt: per-branch CFG scale in TRELLIS units
+                        (``gs = 1 + omega``); the target is usually the stronger.
+            guidance_interval/_rescale: reuse the sampler's CFG window — outside
+                        it BOTH branches drop to ``gs=1`` (pure conditional
+                        velocity), which is exactly FlowEdit's cfg-inactive case.
+            n_avg:      Monte-Carlo samples of the shared per-step noise ``eps``
+                        whose velocity differences are averaged (FlowEdit n_avg).
+            keep_mask:  optional bool mask (broadcastable to the dense latent, or
+                        ``[N_tokens]`` for sparse) hard-pinned to ``x_src`` after
+                        every step — the masked-FlowEdit safety net.  ``None`` =
+                        pure FlowEdit (no mask, the default).
+            seed:       seed for the per-step noise (reproducible runs).
+
+        ``kwargs`` are forwarded verbatim to BOTH branch model calls (e.g. a
+        sparse model's ``concat_cond``); pass only branch-agnostic extras here.
+        """
+        # Same t schedule the forward ``sample`` / ``invert_clean`` use, so the
+        # velocity field is evaluated at consistent timesteps (t: 1 → 0).
+        t_seq = np.linspace(1, 0, steps + 1)
+        t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
+        t_seq = t_seq.tolist()
+        t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
+
+        dev = x_src.feats.device if hasattr(x_src, "feats") else x_src.device
+        gen = None
+        if seed is not None:
+            gen = torch.Generator(device=dev)
+            gen.manual_seed(int(seed))
+
+        z_edit = x_src
+        for t, t_prev in tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
+            v_delta = None
+            for _ in range(max(1, int(n_avg))):
+                eps = _randn_like_x(x_src, gen)
+                # FlowEdit coupling: source branch re-noises the clean source to
+                # level t; target branch carries the accumulated edit offset so
+                # that  z_tgt_t - z_src_t == z_edit - x_src.
+                z_src_t = forward_diffuse_flow(x_src, float(t), self.sigma_min, eps=eps)
+                z_tgt_t = z_edit + (z_src_t - x_src)
+                v_src = self._inference_model(
+                    model, z_src_t, float(t), cond=cond_src, neg_cond=neg_cond,
+                    guidance_strength=guidance_strength_src,
+                    guidance_interval=guidance_interval,
+                    guidance_rescale=guidance_rescale, **kwargs)
+                v_tgt = self._inference_model(
+                    model, z_tgt_t, float(t), cond=cond_tgt, neg_cond=neg_cond,
+                    guidance_strength=guidance_strength_tgt,
+                    guidance_interval=guidance_interval,
+                    guidance_rescale=guidance_rescale, **kwargs)
+                vd = v_tgt - v_src
+                v_delta = vd if v_delta is None else v_delta + vd
+            if n_avg > 1:
+                v_delta = v_delta * (1.0 / n_avg)
+            # Euler update in the codebase's own sign convention (mirrors
+            # ``FlowEulerSampler.sample_once``: x_prev = x_t - (t - t_prev) * v).
+            z_edit = z_edit - (float(t) - float(t_prev)) * v_delta
+            if keep_mask is not None:
+                z_edit = _pin_to(z_edit, x_src, keep_mask)
+        return z_edit
 
     # ─────────────── forward sample (with callback / x_init) ─────────
 

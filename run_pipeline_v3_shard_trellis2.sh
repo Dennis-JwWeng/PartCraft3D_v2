@@ -62,7 +62,7 @@ TAG="${1:?usage: $0 <tag> <config.yaml>}"
 CFG="${2:?usage: $0 <tag> <config.yaml>}"
 
 # This launcher lives at the repo root; server-pool scripts it shells out to
-# (scripts/tools/launch_local_vlm.sh, image_edit_server.py) stay under scripts/tools.
+# (scripts/serve/launch_local_vlm.sh, image_edit_server.py) stay under scripts/serve.
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 [ -f "$CFG" ] || { echo "[ERROR] config not found: $CFG"; exit 1; }
@@ -189,7 +189,7 @@ start_vlm() {
             VLM_TP=1 \
             VLM_MEM_FRAC="${VLM_MEM_FRAC:-0.57}" \
             SGLANG_DISABLE_CUDNN_CHECK=1 \
-                bash scripts/tools/launch_local_vlm.sh
+                bash scripts/serve/launch_local_vlm.sh
         ) > "$log" 2>&1 &
         echo $! >> "$LOG_DIR/vlm.pids"
     done
@@ -231,7 +231,7 @@ start_flux() {
         (
             set +u; source "${CONDA_INIT}" && conda activate "${CONDA_ENV_SERVER}"; set -u
             CUDA_VISIBLE_DEVICES="$gpu" \
-                "$PY_SRV" scripts/tools/image_edit_server.py \
+                "$PY_SRV" scripts/serve/image_edit_server.py \
                     --model "$EDIT_CKPT" --port "$port"
         ) > "$log" 2>&1 &
         echo $! >> "$LOG_DIR/flux.pids"

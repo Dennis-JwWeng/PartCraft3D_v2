@@ -362,19 +362,38 @@ from partcraft.render.overview import (
 #
 # ────────────────────────────── overview render ─────────────────────────────
 
-def render_overview_png(mesh_npz: Path, img_npz: Path, blender: str) -> bytes:
-    """Render the 4×2 overview and return PNG bytes."""
-    top_imgs, frames = load_views_from_npz(img_npz, VIEW_INDICES)
-    H = top_imgs[0].shape[0]
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        part_ids = extract_parts(mesh_npz, tmp)
-        max_pid = max(part_ids) + 1
-        pid_palette = [[200, 200, 200]] * max_pid
-        for pid in part_ids:
-            pid_palette[pid] = _PALETTE[pid % len(_PALETTE)]
-        bot_imgs = run_blender(tmp, blender, H, pid_palette, frames)
-    final = stitch_two_rows(top_imgs, bot_imgs)
+def render_overview_png(
+    mesh_npz: Path,
+    img_npz: "Path | None" = None,
+    blender: "str | None" = None,
+    *,
+    save_viewpoints: "Path | None" = None,
+) -> bytes:
+    """Render the 5×2 overview PNG from the **o-voxel** (no Blender, no input images).
+
+    Top row = coloured o-voxel RGB at ``VIEW_INDICES``; bottom row = per-part
+    palette occupancy o-voxel.  Same BGR layout/contract as the old
+    Blender+packed path (``stitch_two_rows``, ``_PALETTE`` colours), so the
+    downstream gate-highlight + pixel-count logic is unchanged.
+
+    ``img_npz`` / ``blender`` are accepted for backward-compat but unused — the
+    overview is now derived purely from ``mesh_npz``.  When ``save_viewpoints``
+    is given, the per-view camera record is written there (json) so the camera
+    info travels with the overview for downstream stages.
+    """
+    import json as _json
+    from partcraft.pipeline_v3 import trellis2_ovox_render as _ovr
+
+    res = _ovr.render_overview_from_ovox(mesh_npz)
+    # o-voxel renders are RGB; overview contract is BGR (cv2) so the bottom-row
+    # palette lands in _PALETTE_BGR for the gate/pixel-count nearest-colour match.
+    top = [cv2.cvtColor(im, cv2.COLOR_RGB2BGR) for im in res["rgb"]]
+    bot = [cv2.cvtColor(im, cv2.COLOR_RGB2BGR) for im in res["highlight"]]
+    final = stitch_two_rows(top, bot)
+    if save_viewpoints is not None:
+        Path(save_viewpoints).write_text(_json.dumps(
+            {"views": res["views"], "cameras": res["cam"],
+             "part_ids": res["part_ids"]}, indent=2))
     ok, buf = cv2.imencode(".png", final)
     if not ok:
         raise RuntimeError("png encode failed")
@@ -488,7 +507,7 @@ def extract_json_object(text: str) -> dict | None:
 
 REQUIRED_AFTER_FIELDS = ("after_desc_full", "after_desc_stage1", "after_desc_stage2")
 EDIT_TYPES = ("deletion", "modification", "scale", "material", "color", "global")
-N_VIEWS = 5  # must match len(VIEW_INDICES) in render_part_overview
+N_VIEWS = 5  # must match len(VIEW_INDICES) in partcraft.render.overview
 MAX_PARTS = 16  # objects with more parts are skipped
 
 
@@ -1673,22 +1692,43 @@ def _passes_quality_thresholds(judge_json: dict, edit_type: str, thresholds: dic
 
 
 def _load_before_view_images(ctx) -> "list | None":
-    """Load 5 before-state BGR images from the images NPZ at VIEW_INDICES."""
-    from .specs import VIEW_INDICES  # lazy — avoid circular import at module level
-    if ctx.image_npz is None or not ctx.image_npz.is_file():
+    """5 before-state BGR images = the o-voxel RGB **top row** of the saved
+    overview (named views).  No packed input images, no GPU re-render — reuses
+    the overview already rendered in gen_edits.
+    """
+    import cv2 as _cv2
+    from .qc_rules import _N_VIEWS, _COL_SEP, _ROW_SEP
+    ov_path = getattr(ctx, "overview_path", None)
+    if ov_path is None or not Path(ov_path).is_file():
         return None
-    try:
-        from partcraft.render.overview import load_views_from_npz
-        imgs, _ = load_views_from_npz(ctx.image_npz, VIEW_INDICES)
-        return imgs
-    except Exception:
+    ov = _cv2.imread(str(ov_path))
+    if ov is None:
         return None
+    H_total, W_total = ov.shape[:2]
+    W_cell = (W_total - (_N_VIEWS - 1) * _COL_SEP) // _N_VIEWS
+    H_cell = (H_total - _ROW_SEP) // 2
+    out = []
+    for c in range(_N_VIEWS):
+        x0 = c * (W_cell + _COL_SEP)
+        out.append(ov[0:H_cell, x0:x0 + W_cell].copy())
+    return out
 
 
 def _load_after_preview_images(edit_dir: "Path") -> "list | None":
-    """Load preview_0.png … preview_4.png from *edit_dir*. Returns None on any missing file."""
-    import numpy as np
+    """5 after-state BGR images for gate-E.
+
+    Prefer the **post-edit-latents** named renders (``after_view_{name}.png``,
+    written by trellis2_3d on the SAME named cameras as the before); fall back
+    to the legacy ``preview_{0..4}.png`` if those are absent.
+    """
     import cv2 as _cv2
+    from partcraft.render.ovox_views import VIEW_ORDER
+
+    named = [edit_dir / f"after_view_{v}.png" for v in VIEW_ORDER]
+    if all(p.is_file() for p in named):
+        imgs = [_cv2.imread(str(p)) for p in named]
+        if all(i is not None for i in imgs):
+            return imgs
     imgs = []
     for i in range(5):
         p = edit_dir / f"preview_{i}.png"

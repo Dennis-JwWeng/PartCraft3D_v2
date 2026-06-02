@@ -208,9 +208,9 @@ def _load_view_image(spec, obj_record, p25_cfg: dict):
     Falls back to None if the view cannot be resolved; the caller may
     then skip the "before" export.
     """
-    from PIL import Image  # noqa: F401  (used downstream via scripts.run_2d_edit)
+    from PIL import Image  # noqa: F401  (used downstream via partcraft.pipeline_v3.edit_2d)
     try:
-        from scripts.run_2d_edit import prepare_input_image
+        from partcraft.pipeline_v3.edit_2d import prepare_input_image
         if hasattr(spec, "npz_view") and spec.npz_view >= 0:
             _, pil = prepare_input_image(obj_record, spec.npz_view)
             return pil.convert("RGB")
@@ -381,8 +381,8 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
     shape0 = t2e.sparse_denorm_shape(pipeline, p1_feats, coords0)
 
     # ── TRELLIS.1-SS bridge (optional) ────────────────────────────────────
-    # Use externally-generated TRELLIS.1 occupancy (scripts/standalone/
-    # trellis1_ss_coords.py, run in the vinedresser3d env) as the SLat
+    # Use externally-generated TRELLIS.1 occupancy (precomputed offline in the
+    # vinedresser3d env) as the SLat
     # structure and run FREE (vanilla) S2 shape+tex on it — bypasses TRELLIS.2's
     # masked S1 entirely.  Tests whether TRELLIS.1's SS flow gives cleaner
     # geometry than TRELLIS.2's masked S1 (which over-inflates the edit region).
@@ -469,14 +469,38 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
             ss_override["steps"] = int(p25_cfg["trellis2_ss_steps"])
         if p25_cfg.get("trellis2_ss_cfg") is not None:
             ss_override["guidance_strength"] = float(p25_cfg["trellis2_ss_cfg"])
-        coords_new = t2s.edit_structure(
-            pipeline, ss_enc, sampler, coords0, edit_grid,
-            cond_orig_512, cond_edit_512, logger,
-            keep_thresh=s1_thresh,
-            soft_feather=float(p25_cfg.get("trellis2_s1_soft_feather", 0.0)),
-            contact_mask=contact_64, contact_sigma=s1_sigma_eff,
-            ss_param_override=(ss_override or None),
-            ).to(dev)
+        # S1 mode: "masked" (inversion + keep-mask repaint, default) or
+        # "flowedit" (source/target velocity-difference ODE, no inversion / no
+        # SS keep mask — the edit region emerges from the conditioning change).
+        # edit_grid is still computed above and still drives the S2 coord bridge;
+        # only the S1 *latent* edit changes.
+        s1_mode = str(p25_cfg.get("trellis2_s1_mode", "masked")).lower()
+        if s1_mode == "flowedit":
+            # gs_src defaults to gs_tgt (SYMMETRIC CFG): the edit drive should
+            # come from the source→target CONDITION difference only, not a CFG
+            # strength gap.  Asymmetric gs injects a spurious (pos−neg) push that
+            # is nonzero even under identical conditioning and shreds occupancy on
+            # detailed structures (smoke: tank identity recall 0.15 @ gs 3/7.5 vs
+            # 1.00 @ gs 7.5/7.5).  Override trellis2_s1_fe_gs_src to go asymmetric.
+            gs_tgt = float(p25_cfg.get("trellis2_s1_fe_gs_tgt", 7.5))
+            gs_src = float(p25_cfg.get("trellis2_s1_fe_gs_src", gs_tgt))
+            coords_new = t2s.flowedit_structure(
+                pipeline, ss_enc, sampler, coords0,
+                cond_orig_512, cond_edit_512, logger,
+                gs_src=gs_src, gs_tgt=gs_tgt,
+                n_avg=int(p25_cfg.get("trellis2_s1_fe_navg", 1)),
+                seed=int(p25_cfg.get("trellis2_seed", 1)),
+                ss_param_override=(ss_override or None),
+                ).to(dev)
+        else:
+            coords_new = t2s.edit_structure(
+                pipeline, ss_enc, sampler, coords0, edit_grid,
+                cond_orig_512, cond_edit_512, logger,
+                keep_thresh=s1_thresh,
+                soft_feather=float(p25_cfg.get("trellis2_s1_soft_feather", 0.0)),
+                contact_mask=contact_64, contact_sigma=s1_sigma_eff,
+                ss_param_override=(ss_override or None),
+                ).to(dev)
         logger.info("[s5/P4] %s S1 structure: %d → %d voxels (parts=%s)",
                     spec.edit_id, coords0.shape[0], coords_new.shape[0],
                     target_part_ids)
@@ -554,6 +578,47 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
         edit_grid=edit_grid, keep16=keep16,
         s1_pad=s1_pad, s1_thresh=s1_thresh)
     return mesh, latents
+
+
+# ─────────────────── gate-E "after" render (post-edit latents) ────────
+# Render the decoded post-edit mesh at the named views (front/right/back/left/
+# down) so gate-E judges the EDITED-LATENTS result instead of packed previews,
+# on the SAME cameras as the o-voxel "before".  Gated off by default until
+# gate-E is re-enabled.
+
+_ENVMAP_CACHE: dict = {}
+
+
+def _get_envmap(p25_cfg: dict, logger):
+    if "env" in _ENVMAP_CACHE:
+        return _ENVMAP_CACHE["env"]
+    from partcraft.render import ovox_views as _ov
+    cb = p25_cfg.get("trellis2_codebase", "/mnt/zsn/3dobject/TRELLIS.2")
+    hdri = p25_cfg.get("trellis2_hdri", f"{cb}/assets/hdri/forest.exr")
+    env = None
+    try:
+        env = _ov.load_envmap(hdri)
+    except Exception as e:
+        logger.warning("[s5] envmap load failed (%s); after-views unlit", e)
+    _ENVMAP_CACHE["env"] = env
+    return env
+
+
+def _render_after_named_views(mesh_obj, pair_dir: Path, p25_cfg: dict, logger):
+    """Render the decoded post-edit mesh at the named views → ``after_view_{name}.png``.
+
+    Shaded PBR render on the SAME named cameras as the o-voxel "before", so
+    gate-E compares like-for-like.  Consumes the in-memory decoded mesh (the
+    edited-latents result) — no GLB round-trip.
+    """
+    from PIL import Image
+    from partcraft.render import ovox_views as _ov
+    env = _get_envmap(p25_cfg, logger)
+    res = int(p25_cfg.get("trellis2_after_view_res", 512))
+    imgs = _ov.render_sample(mesh_obj, envmap=env, resolution=res)
+    for name, rgb in imgs.items():
+        Image.fromarray(rgb).save(pair_dir / f"after_view_{name}.png")
+    logger.info("[s5] %s rendered %d after-views", pair_dir.name, len(imgs))
 
 
 # ─────────────────── per-object processing ───────────────────────────
@@ -665,6 +730,13 @@ def run_for_object(
                                     spec.edit_id, e)
                 _run_and_export(pipeline, edited_img, after_glb, p25_cfg, log,
                                 mesh_obj=mesh_obj, reframe_mesh_npz=reframe_npz)
+                # gate-E "after" = render the post-edit latents at named views.
+                if bool(p25_cfg.get("trellis2_render_after_views", False)):
+                    try:
+                        _render_after_named_views(mesh_obj, pair_dir, p25_cfg, log)
+                    except Exception as e:
+                        log.warning("[s5] %s after-view render failed: %s",
+                                    spec.edit_id, e)
             else:
                 _run_and_export(pipeline, edited_img, after_glb, p25_cfg, log,
                                 reframe_mesh_npz=reframe_npz)

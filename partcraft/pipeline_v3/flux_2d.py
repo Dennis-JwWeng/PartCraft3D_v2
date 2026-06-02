@@ -100,7 +100,7 @@ from typing import Iterable
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT))
 
-from scripts.run_2d_edit import process_one, check_edit_server  # noqa: E402
+from partcraft.pipeline_v3.edit_2d import process_one, check_edit_server  # noqa: E402
 
 from .paths import ObjectContext
 from .specs import EditSpec, iter_flux_specs

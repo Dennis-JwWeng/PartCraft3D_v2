@@ -9,7 +9,7 @@ Usage (programmatic)::
     from partcraft.cleaning.cleaner import run_cleaning
     run_cleaning(input_dir="partverse_pairs", shards=["00","01"], cfg=cfg)
 
-See also ``scripts/tools/run_cleaning.py`` for CLI.
+See also ``scripts/cleaning/run_cleaning.py`` for CLI.
 """
 
 from __future__ import annotations

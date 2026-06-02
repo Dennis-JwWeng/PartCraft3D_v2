@@ -25,7 +25,7 @@ loop.  Use the helpers below when wiring a custom trainer.
 
 See also
 :class:`partcraft.pipeline_v3.mask_materialization.PartCraftRuntimeMaskBuilder.build_mask_detail`
-and ``scripts/tools/dump_edit_part_mask.py`` for exporting masks + SLAT indices.
+for exporting masks + SLAT indices.
 """
 
 from __future__ import annotations
@@ -168,7 +168,6 @@ def training_entrypoints_inventory() -> dict[str, list[str]]:
     return {
         "mask_export": [
             "partcraft/pipeline_v3/mask_materialization.py",
-            "scripts/tools/dump_edit_part_mask.py",
         ],
         "trellis_inference_core": [
             "partcraft/trellis/refiner.py",

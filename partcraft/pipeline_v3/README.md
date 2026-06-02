@@ -199,7 +199,7 @@ CLI `--best-view-only` 与 YAML 任一为真即可启用「仅最佳视角」。
 | `QC_ONLY_TYPES` | 逗号分隔编辑类型，限制 **`gate_quality`** 只评这些类型（优先级高于 YAML `qc.gate_quality_types`） |
 | `ATTN_BACKEND` | 多 GPU 子进程内默认设为 `flash_attn`（见 `dispatch_gpus`） |
 
-调度脚本层另有：`STAGES`、`FORCE`、`OBJ_IDS_FILE`、`MACHINE_ENV`、`VLM_MEM_FRAC` 等，见 `scripts/tools/run_pipeline_v3_shard.sh` 注释。
+调度脚本层另有：`STAGES`、`FORCE`、`OBJ_IDS_FILE`、`MACHINE_ENV`、`VLM_MEM_FRAC` 等，见 `run_pipeline_v3_shard_trellis2.sh` 注释。
 
 ---
 
@@ -227,10 +227,10 @@ CLI `--best-view-only` 与 YAML 任一为真即可启用「仅最佳视角」。
 在同一台机器上按 **YAML 中的 stage 拓扑**（顺序 batch、并行 group、串链子链）起停 VLM/FLUX 服务并调用 `python -m partcraft.pipeline_v3.run --stage ...` 时，可使用：
 
 ```bash
-bash scripts/tools/run_pipeline_v3_shard.sh <tag> <config.yaml>
+bash run_pipeline_v3_shard_trellis2.sh <tag> <config.yaml>
 ```
 
-其它变体如 `run_pipeline_v3_bench.sh`、`run_pipeline_v3_bench100.sh` 见 `scripts/tools/` 内注释。该类脚本通常依赖 `configs/machine/<hostname>.env` 中的 conda 与 checkpoint 环境变量。
+该脚本通常依赖 `configs/machine/<hostname>.env` 中的 conda 与 checkpoint 环境变量。
 
 ---
 
