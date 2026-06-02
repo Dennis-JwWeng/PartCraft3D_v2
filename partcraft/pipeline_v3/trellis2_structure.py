@@ -187,4 +187,97 @@ def edit_structure(
     return coords_new
 
 
-__all__ = ["get_ss_encoder", "edit_structure", "SS_ENC_NAME"]
+@torch.no_grad()
+def flowedit_structure(
+    pipeline,
+    ss_enc,
+    sampler,
+    coords0: torch.Tensor,
+    cond_orig: dict,
+    cond_edit: dict,
+    logger,
+    *,
+    gs_src: float = 7.5,
+    gs_tgt: float = 7.5,
+    n_avg: int = 1,
+    keep_mask: torch.Tensor | None = None,
+    seed: int = 1,
+    ss_param_override: dict | None = None,
+) -> torch.Tensor:
+    """FlowEdit the sparse structure (no inversion, no mask); return ``coords_new``.
+
+    Drop-in alternative to :func:`edit_structure`: same in/out contract (takes
+    ``coords0`` + original/edited 512-res image conds, returns ``[M,3]`` int
+    voxel indices 0..63), so the downstream geometry/material stages are
+    unchanged.  Instead of inverting the SS latent and re-injecting a keep mask,
+    it drives the clean SS latent with the source/target guided-velocity
+    difference — the edit is localized by the conditioning change, and non-edit
+    voxels stay put because the two branches agree there.
+
+    Args:
+        gs_src/gs_tgt: per-branch CFG strength in TRELLIS units (``gs = 1 + ω``).
+                       Default SYMMETRIC (both 7.5): the edit drive comes from the
+                       source→target condition difference, not a CFG gap.  An
+                       asymmetric gap injects a (pos−neg) push that is nonzero even
+                       under identical conditioning and destroys locality on
+                       detailed structures — keep them equal unless you know why.
+        n_avg:         FlowEdit Monte-Carlo samples per step (1 = cheapest).
+        keep_mask:     optional 16³ bool preserve mask for the masked-FlowEdit
+                       safety net (``None`` = pure FlowEdit, the default path).
+        seed:          per-step noise seed (reproducible).
+    """
+    dev = "cuda"
+    ss_flow = pipeline.models["sparse_structure_flow_model"]
+    ss_dec = pipeline.models["sparse_structure_decoder"]
+    params = {**pipeline.sparse_structure_sampler_params, **(ss_param_override or {})}
+    gi = params.get("guidance_interval", (0.0, 1.0))
+    grescale = params.get("guidance_rescale", 0.0)
+    steps = int(params["steps"])
+    rescale_t = float(params.get("rescale_t", 1.0))
+    logger.info("[s5/S1] FlowEdit: steps=%d gs_src=%.1f gs_tgt=%.1f n_avg=%d "
+                "interval=%s rt=%.1f%s", steps, gs_src, gs_tgt, n_avg, gi,
+                rescale_t, " (masked safety net)" if keep_mask is not None else "")
+
+    # occupancy [1,1,64,64,64] → SS latent z_s0 (16³×8), the clean SOURCE.
+    c = coords0.long().to(dev)
+    occ = torch.zeros(1, 1, 64, 64, 64, device=dev)
+    occ[0, 0, c[:, 0], c[:, 1], c[:, 2]] = 1.0
+    z_s0 = ss_enc(occ.float())
+
+    if pipeline.low_vram:
+        ss_flow.to(dev)
+    z_s_new = sampler.flowedit_sample(
+        ss_flow, z_s0,
+        cond_src=cond_orig["cond"], cond_tgt=cond_edit["cond"],
+        neg_cond=cond_orig["neg_cond"],
+        steps=steps, rescale_t=rescale_t,
+        guidance_strength_src=gs_src, guidance_strength_tgt=gs_tgt,
+        guidance_interval=gi, guidance_rescale=grescale,
+        n_avg=n_avg, keep_mask=keep_mask, seed=seed,
+        verbose=False, tqdm_desc="S1 flowedit",
+    )
+    if pipeline.low_vram:
+        ss_flow.cpu()
+
+    if pipeline.low_vram:
+        ss_dec.to(dev)
+    decoded = ss_dec(z_s_new) > 0
+    if pipeline.low_vram:
+        ss_dec.cpu()
+    coords_new = torch.argwhere(decoded)[:, [0, 2, 3, 4]][:, 1:].int().cpu()
+    # Same degenerate-edit guard as edit_structure: a near-global edit can
+    # collapse the structure to (near-)empty and break the downstream bridge.
+    n_new = int(coords_new.shape[0])
+    n_in = int(c.shape[0])
+    logger.info("[s5/S1] FlowEdit structure: %d → %d voxels "
+                "(z_s0 norm=%.2f, z_new norm=%.2f)", n_in, n_new,
+                float(z_s0.norm()), float(z_s_new.norm()))
+    if n_new < 32:
+        raise ValueError(
+            f"S1 structure collapsed: {n_in} → {n_new} voxels "
+            f"(FlowEdit diverged or edit region too large). Skipping this edit."
+        )
+    return coords_new
+
+
+__all__ = ["get_ss_encoder", "edit_structure", "flowedit_structure", "SS_ENC_NAME"]

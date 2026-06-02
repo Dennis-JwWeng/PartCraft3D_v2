@@ -58,7 +58,7 @@ def resolve_2d_conditioning(
 
     if edited_path.exists():
         try:
-            from scripts.run_2d_edit import prepare_input_image
+            from partcraft.pipeline_v3.edit_2d import prepare_input_image
 
             edited = Image.open(edited_path).convert("RGB").resize((518, 518))
             input_path = base_dir / f"{spec.edit_id}_input.png"
@@ -76,7 +76,7 @@ def resolve_2d_conditioning(
 
     if prerender_img is None and not cache_only_2d and hasattr(spec, "npz_view") and spec.npz_view >= 0:
         try:
-            from scripts.run_2d_edit import call_local_edit, call_vlm_edit, prepare_input_image
+            from partcraft.pipeline_v3.edit_2d import call_local_edit, call_vlm_edit, prepare_input_image
 
             img_bytes, pil_img = prepare_input_image(obj_record, spec.npz_view)
             after_desc = spec.new_parts_desc or ""

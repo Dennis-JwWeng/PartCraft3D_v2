@@ -125,7 +125,7 @@ class ObjectRecord:
             raise ValueError(
                 f"Only GLB-format mesh keys are supported, got {key!r}. "
                 f"Legacy PLY NPZs were retired; re-pack via "
-                f"scripts/datasets/partverse/pack_npz.py.")
+                f"scripts/data_prep/partverse/pack_npz.py.")
         if "vd_scale" not in self._mesh_npz.files:
             raise KeyError(
                 f"{self.mesh_npz_path}: 'vd_scale' key missing — this NPZ "

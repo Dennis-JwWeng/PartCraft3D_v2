@@ -53,7 +53,6 @@ def _encode_asset_script() -> str:
 
 
 sys.path.insert(0, str(_ROOT))
-sys.path.insert(0, str(_ROOT / "scripts" / "standalone"))
 sys.path.insert(0, str(_ROOT / "third_party"))
 
 from .paths import ObjectContext
@@ -358,7 +357,7 @@ def _render_trellis_five_views(
     (which calls cv2.imwrite) writes the correct channel order.
     """
     import cv2 as _cv2
-    from render_phase1v2_3d_results import render_one_view as _render_one_view, load_slat as _load_slat  # type: ignore
+    from partcraft.render.slat_render import render_one_view as _render_one_view, load_slat as _load_slat
     slat = _load_slat(npz_path)
     imgs = []
     for frame in frames:

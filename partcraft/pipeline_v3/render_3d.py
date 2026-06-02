@@ -11,9 +11,9 @@ to pick the part). The rendered images go next to the npz::
 This makes the report (s8) able to show "3D before / 3D after" at the
 same camera as the original / highlight / FLUX edit columns.
 
-The runner is single-GPU and re-uses the legacy
+The runner is single-GPU and re-uses the
 ``frame_to_extrinsic_intrinsic`` + ``render_one_view`` helpers from
-[scripts/standalone/render_phase1v2_3d_results.py](../../scripts/standalone/render_phase1v2_3d_results.py).
+``partcraft.render.slat_render``.
 ``ATTN_BACKEND=xformers`` should be set before importing trellis if
 flash-attn is unavailable in the active env (vinedresser3d).
 """
@@ -33,7 +33,6 @@ from PIL import Image
 
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT))
-sys.path.insert(0, str(_ROOT / "scripts" / "standalone"))
 sys.path.insert(0, str(_ROOT / "third_party"))
 
 from .paths import ObjectContext
@@ -65,7 +64,7 @@ def _hardlink_or_copy(src: Path, dst: Path) -> None:
 
 def _lazy_helpers():
     """Import the trellis-dependent helpers on first use."""
-    from render_phase1v2_3d_results import (  # type: ignore
+    from partcraft.render.slat_render import (
         frame_to_extrinsic_intrinsic, render_one_view, load_slat,
     )
     from partcraft.render.overview import load_views_from_npz
@@ -106,7 +105,7 @@ def run_for_object(
         res.error = "missing_parsed_json"; return res
 
     _, _, load_slat, load_views_from_npz = _lazy_helpers()
-    from render_phase1v2_3d_results import render_one_view  # type: ignore
+    from partcraft.render.slat_render import render_one_view
 
     _, frames = load_views_from_npz(ctx.image_npz, VIEW_INDICES)
 

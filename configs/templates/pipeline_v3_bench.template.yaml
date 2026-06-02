@@ -11,15 +11,15 @@
 #        cp configs/machine/template.env configs/machine/$(hostname).env
 #      并改其中的 conda env / 数据根目录 / checkpoint 路径。
 #   3) 校验输入数据齐备：
-#        bash scripts/tools/validate_bench_inputs.sh configs/my_run.yaml
+#        bash scripts/ops/validate_bench_inputs.sh configs/my_run.yaml
 #      (检查 mesh / images / slat 三套 NPZ 是否完整)
 #   4) 启动管线：
-#        bash scripts/tools/run_pipeline_v3_shard.sh configs/my_run.yaml
+#        bash run_pipeline_v3_shard_trellis2.sh <tag> configs/my_run.yaml
 #      (脚本自动 source configs/machine/$(hostname).env，
 #       根据 pipeline.gpus 拉起 VLM / FLUX 子进程，运行 stages)
 #   5) 监控：
-#        python scripts/tools/show_progress.py <output_dir>
-#        python scripts/tools/summarize_edit_status.py <output_dir>
+#        python scripts/ops/show_progress.py <output_dir>
+#        python scripts/ops/summarize_edit_status.py <output_dir>
 #
 # Stage 顺序：gen_edits → gate_text_align → (del_mesh ∥ flux_2d → trellis_3d
 #                                            → preview_flux ∥ preview_del)
@@ -29,13 +29,9 @@
 #   缺失 → from_parsed_edit 抛 ValueError，不会用固定视角兜底。
 #
 # 单步运行（断点续跑或调试用）：
-#   bash scripts/tools/run_pipeline_v3_shard.sh configs/my_run.yaml \
+#   bash run_pipeline_v3_shard_trellis2.sh <tag> configs/my_run.yaml \
 #       --steps gate_text_align,flux_2d
 #   --force 可重跑已 done 的 edit（仍尊重 gate_a prereq）。
-#
-# 重跑某类编辑：
-#   python scripts/tools/reset_v3_edits_by_type.py <output_dir> --type material
-#   再 rerun pipeline。
 # =====================================================================
 
 blender: /path/to/blender

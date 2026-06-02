@@ -18,8 +18,8 @@ cp configs/machine/template.env configs/machine/$(hostname).env
 $EDITOR configs/my_run.yaml configs/machine/$(hostname).env
 
 # 3. Validate inputs, then run a shard end-to-end
-bash scripts/tools/validate_bench_inputs.sh configs/my_run.yaml
-bash scripts/tools/run_pipeline_v3_shard.sh configs/my_run.yaml
+bash scripts/ops/validate_bench_inputs.sh configs/my_run.yaml
+bash run_pipeline_v3_shard_trellis2.sh <tag> configs/my_run.yaml
 ```
 
 Direct Python CLI (useful for single-stage debugging or CI):
@@ -72,10 +72,15 @@ configs/
   templates/            pipeline + machine env template (the only config you keep)
   h3d_v1_full_bench_scale_consistent_del.yaml
 scripts/
-  tools/run_pipeline_v3_shard.sh    main shell entry
-  tools/validate_bench_inputs.sh    pre-flight check
-  tools/run_pipeline_v3_bench.sh    bench helper (tmux)
-  datasets/{partverse,partobjaverse,h3d_v1}/   one-time dataset packers
+  serve/          VLM + FLUX image-edit servers (launched by the shard runner)
+  viz/            ss / slat / o-voxel visualization & render tools
+  experiments/    research runners (rerun_shard_masked_edit.py)
+  cleaning/       data cleaning + QC report
+  ops/            progress / status / input validation
+  blender/        Blender render helpers
+  data_prep/      one-time dataset packers (partverse / partobjaverse)
+  setup/          environment bootstrap
+run_pipeline_v3_shard_trellis2.sh   main shell entry (repo root)
 docs/
   PIPELINE.md                       full pipeline architecture
   PIPELINE_V3_VLM_PROMPTS.md        VLM prompt specs (3 calls)

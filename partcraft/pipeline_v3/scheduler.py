@@ -217,7 +217,7 @@ def dump_hook_meta(cfg: dict, name: str) -> dict:
     returned dict mirrors :class:`Hook` field names. ``command`` and
     ``env_passthrough`` are shallow-copied so downstream mutation does
     not alias back into the parsed hook. (The shipped shell driver in
-    ``run_pipeline_v3_shard.sh`` uses :func:`get_hook` +
+    ``run_pipeline_v3_shard_trellis2.sh`` uses :func:`get_hook` +
     :func:`resolve_hook_command` directly; ``dump_hook_meta`` stays
     available for JSON-oriented callers.)
     """
