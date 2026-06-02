@@ -66,6 +66,8 @@ def masked_shape_slat(
     nn_init: bool = False,
     anchor_mode: str = "perstep",
     anchor_cutoff: float = 0.3,
+    contact_mask: torch.Tensor | None = None,
+    contact_sigma: float | None = None,
 ):
     """Edit shape SLat on ``coords_new``; preserve non-edit tokens.
 
@@ -170,6 +172,24 @@ def masked_shape_slat(
     elif anchor_mode == "release_late":
         cb = make_bridged_anchor_callback(
             inv, preserved, src_idx, schedule="early", cutoff_t=float(anchor_cutoff))
+    elif anchor_mode == "contact_soft":
+        # v1-faithful: preserved tokens NEAR the contact boundary are allowed to
+        # blend with the generation (heals the seam); tokens far from contact are
+        # fully anchored to the inverted original.  Per-token weight from the
+        # contact-distance soft mask (mirrors interweave get_s2_soft_mask).
+        from .trellis2_contact_mask import get_s2_soft_mask
+        c3 = coords_new.to(dev)
+        c3 = c3[:, 1:] if c3.shape[1] == 4 else c3
+        sigma = float(contact_sigma) if contact_sigma is not None else 5.0
+        soft_w = get_s2_soft_mask(
+            c3[preserved], edit_grid64, sigma=sigma, contact_mask=contact_mask
+        ).to(dev)
+        cb = make_bridged_anchor_callback(
+            inv, preserved, src_idx, soft_w=soft_w)
+        logger.info("[s5/S2] shape contact-soft: %d preserved tokens, "
+                    "blend-weight range [%.2f, %.2f] (sigma=%.2f)",
+                    int(preserved.sum()), float(soft_w.min()) if soft_w.numel() else 0.0,
+                    float(soft_w.max()) if soft_w.numel() else 0.0, sigma)
     else:  # "perstep"
         cb = make_bridged_anchor_callback(inv, preserved, src_idx)
     x_init = _sparse_on(coords_new, feats_init)
@@ -207,6 +227,8 @@ def masked_tex_slat(
     cond_edit: dict,
     logger,
     anchor_mode: str = "perstep",
+    contact_mask: torch.Tensor | None = None,
+    contact_sigma: float | None = None,
 ):
     """Edit texture SLat on ``coords_new``; preserve non-edit material.
 
@@ -274,7 +296,20 @@ def masked_tex_slat(
     feats_init = torch.randn(coords_new.shape[0], tex_dim, device=dev)
     feats_init[preserved] = inv[1.0].feats[src_idx]
     x_init = shape_new_norm.replace(feats_init)
-    cb = make_bridged_anchor_callback(inv, preserved, src_idx)
+    if anchor_mode == "contact_soft":
+        from .trellis2_contact_mask import get_s2_soft_mask
+        c3 = coords_new.to(dev)
+        c3 = c3[:, 1:] if c3.shape[1] == 4 else c3
+        sigma = float(contact_sigma) if contact_sigma is not None else 5.0
+        soft_w = get_s2_soft_mask(
+            c3[preserved], edit_grid64, sigma=sigma, contact_mask=contact_mask
+        ).to(dev)
+        cb = make_bridged_anchor_callback(
+            inv, preserved, src_idx, soft_w=soft_w)
+        logger.info("[s5/S2] tex contact-soft: %d preserved tokens (sigma=%.2f)",
+                    int(preserved.sum()), sigma)
+    else:
+        cb = make_bridged_anchor_callback(inv, preserved, src_idx)
 
     out = sampler.sample(
         flow, x_init,

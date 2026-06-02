@@ -269,6 +269,29 @@ def _target_block_keys_64(
     return torch.cat(blocks).unique()
 
 
+def _keys_to_grid(keys: torch.Tensor) -> torch.Tensor:
+    """Dense ``[64,64,64]`` bool grid from flat int64 block keys."""
+    g = GRID_LO
+    grid = torch.zeros(g, g, g, dtype=torch.bool)
+    if keys.numel():
+        grid[(keys // (g * g)).long(),
+             ((keys // g) % g).long(),
+             (keys % g).long()] = True
+    return grid
+
+
+def _all_part_ids(mesh_npz_path: Path) -> list[int]:
+    """Every ``part_<id>.glb`` id stored in the mesh npz, sorted."""
+    import re
+    d = np.load(mesh_npz_path, allow_pickle=True)
+    ids = []
+    for f in d.files:
+        m = re.match(r"part_(\d+)\.glb$", f)
+        if m:
+            ids.append(int(m.group(1)))
+    return sorted(ids)
+
+
 def _dilate_grid(grid: torch.Tensor, pad: int) -> torch.Tensor:
     """Chebyshev (box) dilation of a dense [G,G,G] bool grid by ``pad`` cells."""
     if pad <= 0:
@@ -286,6 +309,7 @@ def part_edit_grid_64(
     pad: int = 3,
     full_mesh_for_normalize: bool = True,
     canonical: bool = False,
+    subtract_preserved: bool = False,
 ) -> torch.Tensor:
     """Dense ``[64,64,64]`` bool edit region for the *structure* stage.
 
@@ -296,19 +320,27 @@ def part_edit_grid_64(
 
     ``canonical`` is forwarded to :func:`_target_block_keys_64` so the region
     matches canonical-frame coords0 when canonical encoding is on.
+
+    ``subtract_preserved`` (v1 anti-inflation): voxelize the OTHER (non-target)
+    GT parts and remove them from the dilated region, so the pad/dilation never
+    eats into preserved geometry (mirrors v1 ``mask & ~preserved_parts``).  For a
+    single-part / whole-object asset this is a no-op (no preserved parts exist).
     """
     keys = _target_block_keys_64(
         mesh_npz_path, target_part_ids,
         full_mesh_for_normalize=full_mesh_for_normalize,
         canonical=canonical)
-    grid = torch.zeros(GRID_LO, GRID_LO, GRID_LO, dtype=torch.bool)
-    if keys.numel():
-        g = GRID_LO
-        xs = (keys // (g * g)).long()
-        ys = ((keys // g) % g).long()
-        zs = (keys % g).long()
-        grid[xs, ys, zs] = True
-    return _dilate_grid(grid, pad)
+    grid = _dilate_grid(_keys_to_grid(keys), pad)
+    if subtract_preserved:
+        tgt = {int(t) for t in target_part_ids}
+        pres_ids = [p for p in _all_part_ids(mesh_npz_path) if p not in tgt]
+        if pres_ids:
+            pres_keys = _target_block_keys_64(
+                mesh_npz_path, pres_ids,
+                full_mesh_for_normalize=full_mesh_for_normalize,
+                canonical=canonical)
+            grid = grid & ~_keys_to_grid(pres_keys).to(grid.device)
+    return grid
 
 
 def edit_grid_64_to_keep16(grid64: torch.Tensor, thresh: float = 0.1) -> torch.Tensor:
