@@ -36,7 +36,7 @@ def read_white_model_flag(ctx) -> bool:
         return False
 
 
-def build_white_model_mesh(pipeline, shape_slat, logger=None):
+def build_white_model_mesh(pipeline, shape_slat, logger=None, res=1024):
     """Decode ``shape_slat`` into a MeshWithVoxel with a flat grey PBR material,
     skipping the texture SLat sampler (TRELLIS.2 third stage).
 
@@ -55,7 +55,7 @@ def build_white_model_mesh(pipeline, shape_slat, logger=None):
         )
     )
 
-    meshes = pipeline.decode_latent(shape_slat, dummy_tex, 1024)
+    meshes = pipeline.decode_latent(shape_slat, dummy_tex, res)
     mesh = meshes[0]
 
     # Overwrite the (garbage) decoded attrs with a constant grey PBR.

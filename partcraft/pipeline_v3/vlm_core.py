@@ -1692,11 +1692,21 @@ def _passes_quality_thresholds(judge_json: dict, edit_type: str, thresholds: dic
 
 
 def _load_before_view_images(ctx) -> "list | None":
-    """5 before-state BGR images = the o-voxel RGB **top row** of the saved
-    overview (named views).  No packed input images, no GPU re-render — reuses
-    the overview already rendered in gen_edits.
+    """5 before-state BGR images at the named views.
+
+    Prefer the **PBR** ``gate_views/before_view_{name}.png`` (white bg, same
+    PbrMeshRenderer as the "after" — rendered once per object in trellis2_3d);
+    fall back to cropping the o-voxel overview top row if those are absent.
     """
     import cv2 as _cv2
+    from partcraft.render.ovox_views import VIEW_ORDER
+    gate_dir = Path(ctx.dir) / "gate_views"
+    named = [gate_dir / f"before_view_{v}.png" for v in VIEW_ORDER]
+    if all(p.is_file() for p in named):
+        imgs = [_cv2.imread(str(p)) for p in named]
+        if all(i is not None for i in imgs):
+            return imgs
+    # fallback: o-voxel overview top row
     from .qc_rules import _N_VIEWS, _COL_SEP, _ROW_SEP
     ov_path = getattr(ctx, "overview_path", None)
     if ov_path is None or not Path(ov_path).is_file():
@@ -2412,6 +2422,13 @@ async def _judge_2d_edit(client, vlm_model, spec, ctx, thresholds, force) -> str
         return "skip"   # flux_2d not done for this edit yet
 
     coll = _make_2d_pair_collage(inp, edt)
+    if coll is not None:
+        try:
+            _dbg = Path(ctx.dir) / "debug" / "gate_2d"
+            _dbg.mkdir(parents=True, exist_ok=True)
+            (_dbg / f"{spec.edit_id}.png").write_bytes(coll)
+        except Exception:
+            pass
     if coll is None:
         _update_edit_gate(ctx, spec.edit_id, spec.edit_type, "C",
                           vlm_result={"pass": False, "score": 0.0,
@@ -2783,6 +2800,13 @@ async def _run_text_align_gate_for_object(
             gate_img = await _asyncio.to_thread(
                 build_text_align_gate_image, ov_img, sel, column_map
             )
+            # stage debug viz: the gate-A highlight image the VLM actually sees
+            try:
+                _dbg = Path(ctx.dir) / "debug" / "gate_a"
+                _dbg.mkdir(parents=True, exist_ok=True)
+                (_dbg / f"{edit_id}.png").write_bytes(gate_img)
+            except Exception:
+                pass
             gate_user = build_text_align_gate_prompt(et, prompt, sel)
             gate_raw = await call_vlm_image_async(
                 client, gate_img,

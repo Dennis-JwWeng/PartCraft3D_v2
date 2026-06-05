@@ -101,3 +101,6 @@ reports/
 /bench_review/local_glb_*.json
 /configs/_gen/
 /logs/salvage/
+
+# Qoder IDE workspace metadata
+.qoder/

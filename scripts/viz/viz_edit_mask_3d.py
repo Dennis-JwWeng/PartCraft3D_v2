@@ -38,14 +38,28 @@ TRELLIS2_DIR = os.environ.get("TRELLIS2_DIR", "/mnt/zsn/3dobject/TRELLIS.2")
 if TRELLIS2_DIR not in sys.path:
     sys.path.insert(0, TRELLIS2_DIR)
 
-G = 64
+G = 64  # default / legacy 1024-edit grid; per-edit grid is auto-detected below
 
 
-def _edit_grid_dense(ss):
+def _grid_of(*arrs):
+    """Detect the SLat coord grid (32 for 512-edit-res, 64 for 1024) from coords.
+
+    coords live on ``res//16``: 1024->64³ (coords 0..63), 512->32³ (0..31).
+    """
+    cmax = 0
+    for a in arrs:
+        a = np.asarray(a)
+        if a.size and a.ndim >= 2:
+            c = a[:, 1:] if a.shape[1] == 4 else a
+            cmax = max(cmax, int(c.max()))
+    return 32 if cmax < 32 else 64
+
+
+def _edit_grid_dense(ss, g_res=G):
     eg = np.asarray(ss["edit_grid"])
     if eg.ndim == 3:
         return eg.astype(bool)
-    g = np.zeros((G, G, G), bool)
+    g = np.zeros((g_res, g_res, g_res), bool)
     e = eg.astype(int)
     g[e[:, 0], e[:, 1], e[:, 2]] = True
     return g
@@ -142,14 +156,21 @@ def main():
 
     index = []
     for obj in objs:
-        for ed in sorted(obj.iterdir()):
+        # current pipeline nests edits under <obj>/edits_3d/; legacy trees put
+        # them directly under <obj>/.  Support both.
+        edits_parent = obj / "edits_3d" if (obj / "edits_3d").is_dir() else obj
+        for ed in sorted(edits_parent.iterdir()):
+            if not ed.is_dir():
+                continue
             ld = ed / "latents"
             if not (ld / "ss.npz").is_file():
                 continue
             ss = np.load(ld / "ss.npz", allow_pickle=True)
             coords0 = _c3(ss["coords0"]).astype(np.int32)
             coords_new = _c3(ss["coords_new"]).astype(np.int32)
-            edit = _edit_grid_dense(ss)
+            g_res = _grid_of(coords0, coords_new, ss["edit_grid"])  # 32 (512) or 64 (1024)
+            blk = g_res // 16                                       # //4 @64³, //2 @32³
+            edit = _edit_grid_dense(ss, g_res)
             keep16 = np.asarray(ss["keep16"]).astype(bool)     # [16,16,16]
             et = str(ss["edit_type"]) if "edit_type" in ss.keys() else "?"
 
@@ -158,7 +179,7 @@ def main():
 
             # ── STAGE 1: SS mask @16^3 — the actual resolution the SS flow masks.
             #    Render the object's occupied 16^3 blocks, colored by keep16.
-            b16 = np.unique(coords0 // 4, axis=0).astype(np.int32)
+            b16 = np.unique(coords0 // blk, axis=0).astype(np.int32)
             keep_b = keep16[b16[:, 0], b16[:, 1], b16[:, 2]]    # True=preserve
             col16 = np.where(keep_b[:, None], GREEN, RED)
 
@@ -179,13 +200,13 @@ def main():
                 tx = np.load(tex_p, allow_pickle=True)
                 txc = _c3(tx["coords"]).astype(np.int32)
                 col_tex = pca_rgb(np.asarray(tx["feats"]))
-                t_tex = tile2x2(render4(vox(txc, col_tex)))
+                t_tex = tile2x2(render4(vox(txc, col_tex, res=g_res)))
             else:
                 t_tex = None
 
             t_s1 = tile2x2(render4(vox(b16, col16, res=16)))
-            t_s2 = tile2x2(render4(vox(coords0, colS2)))
-            t_shp = tile2x2(render4(vox(shc, col_shape)))
+            t_s2 = tile2x2(render4(vox(coords0, colS2, res=g_res)))
+            t_shp = tile2x2(render4(vox(shc, col_shape, res=g_res)))
 
             e2d = obj_root / obj.name / args.edits_2d_subdir
             sz = t_s1.shape[0]
@@ -198,16 +219,16 @@ def main():
                      Image.fromarray(t_shp), tex_img]
             labels = ["2D original", "2D edited",
                       "S1 mask @16^3 (before) grn=keep red=edit",
-                      "S2 mask @64^3 (before) grn=keep red=edit",
-                      "shape SLat PCA @64^3 (after)",
-                      "tex SLat PCA @64^3 (after)" + ("" if t_tex is not None else " (white-model: none)")]
+                      f"S2 mask @{g_res}^3 (before) grn=keep red=edit",
+                      f"shape SLat PCA @{g_res}^3 (after)",
+                      f"tex SLat PCA @{g_res}^3 (after)" + ("" if t_tex is not None else " (white-model: none)")]
             W = len(cells) * sz + (len(cells) + 1) * pad
             H = hdr + sz + 22 + pad
             sheet = Image.new("RGB", (W, H), (255, 255, 255))
             d = ImageDraw.Draw(sheet)
             flag = "  <<< MASK ~ WHOLE OBJECT" if cov >= 60 else ""
             d.text((pad, 8), f"{obj.name[:8]} {ed.name.replace(obj.name,'').strip('_')} "
-                   f"[{et}]   coverage={cov:.1f}%{flag}", fill=(0, 0, 0))
+                   f"[{et}]  grid={g_res}^3  coverage={cov:.1f}%{flag}", fill=(0, 0, 0))
             for i, (im, lb) in enumerate(zip(cells, labels)):
                 x = pad + i * (sz + pad)
                 sheet.paste(im, (x, hdr))
