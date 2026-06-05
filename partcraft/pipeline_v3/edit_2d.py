@@ -389,12 +389,19 @@ def process_one(spec: EditSpec, dataset, client, output_dir: Path,
         view_name = getattr(spec, "view_name", "") or ""
         result["view_id"] = view_name or getattr(spec, "npz_view", -1)
 
-        # 2. Prepare input image from the o-voxel at the named view (no packed
-        #    images, no Blender).  Falls back to the packed best-view only if no
-        #    named view is set (legacy specs).
+        # 2. Prepare input image.  Prefer the unified PBR render saved by the
+        #    encode stage (gate_views/before_view_<name>.png — same realistic
+        #    render as the overview/gate-E); fall back to an on-the-fly o-voxel
+        #    render, then to the packed best-view (legacy specs).
         if view_name:
-            img_bytes, pil_img = prepare_input_image_ovox(
-                obj.mesh_npz_path, view_name)
+            import io as _io
+            from PIL import Image as _Image
+            saved = Path(output_dir).parent / "gate_views" / f"before_view_{view_name}.png"
+            if saved.is_file():
+                pil_img = _Image.open(saved).convert("RGB").resize((518, 518))
+                _b = _io.BytesIO(); pil_img.save(_b, format="PNG"); img_bytes = _b.getvalue()
+            else:
+                img_bytes, pil_img = prepare_input_image_ovox(obj.mesh_npz_path, view_name)
         else:
             if hasattr(spec, 'npz_view') and spec.npz_view >= 0:
                 best_view = spec.npz_view

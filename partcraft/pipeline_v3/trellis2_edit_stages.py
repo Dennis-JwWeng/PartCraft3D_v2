@@ -68,8 +68,13 @@ def masked_shape_slat(
     anchor_cutoff: float = 0.3,
     contact_mask: torch.Tensor | None = None,
     contact_sigma: float | None = None,
+    res: int = 1024,
 ):
     """Edit shape SLat on ``coords_new``; preserve non-edit tokens.
+
+    ``res`` selects the SLat flow-model resolution (``shape_slat_flow_model_{res}``)
+    and the coord grid (``res//16``: 64³ for 1024, 32³ for 512).  ``coords0`` /
+    ``coords_new`` / ``edit_grid64`` must already live on that grid.
 
     Returns the denormalized shape SLat (SparseTensor on ``coords_new``).
 
@@ -111,7 +116,8 @@ def masked_shape_slat(
         a clean seamless mesh matters more than bit-exact body preservation.
     """
     dev = "cuda"
-    flow = pipeline.models["shape_slat_flow_model_1024"]
+    grid = res // 16
+    flow = pipeline.models[f"shape_slat_flow_model_{res}"]
     params = pipeline.shape_slat_sampler_params
     mean, std = _norm_pair(pipeline.shape_slat_normalization, dev)
     gi = params.get("guidance_interval", (0.0, 1.0))
@@ -131,13 +137,13 @@ def masked_shape_slat(
         steps=steps, rescale_t=rescale_t, verbose=False, tqdm_desc="S2 shape inv",
     )
 
-    preserved, src_idx = build_coord_bridge(coords0, coords_new, edit_grid64)
+    preserved, src_idx = build_coord_bridge(coords0, coords_new, edit_grid64, grid=grid)
     preserved, src_idx = preserved.to(dev), src_idx.to(dev)
     feats_init = torch.randn(coords_new.shape[0], flow.in_channels, device=dev)
     feats_init[preserved] = inv[1.0].feats[src_idx]
     seeded = preserved.clone()
     if warmstart or nn_init:
-        warm, warm_src = incore_edit_bridge(coords0, coords_new, edit_grid64)
+        warm, warm_src = incore_edit_bridge(coords0, coords_new, edit_grid64, grid=grid)
         warm, warm_src = warm.to(dev), warm_src.to(dev)
         feats_init[warm] = inv[1.0].feats[warm_src]
         seeded = seeded | warm
@@ -229,17 +235,29 @@ def masked_tex_slat(
     anchor_mode: str = "perstep",
     contact_mask: torch.Tensor | None = None,
     contact_sigma: float | None = None,
+    res: int = 1024,
+    before_tex_denorm: torch.Tensor | None = None,
 ):
     """Edit texture SLat on ``coords_new``; preserve non-edit material.
+
+    ``res`` selects ``tex_slat_flow_model_{res}`` and the coord grid (``res//16``);
+    all coords / ``edit_grid64`` must already live on that grid.
 
     The reference texture is the model's own texture for the ORIGINAL image on
     ``C0`` (so coords always align with the original shape); it is inverted and
     re-injected outside the edit region while the edit region regenerates under
     the EDITED image + edited shape.  Returns denormalized tex SLat on
     ``coords_new``.
+
+    ``before_tex_denorm`` ([N0, tex_dim] aligned to ``coords0``) is the P1
+    VAE-**encoded** original texture latent (``tex_slat_e{res}.npz``).  When given
+    with ``anchor_mode="posthoc"`` it is hard-pasted onto the preserved tokens at
+    the end (S1 ``restore_preserved``-style) instead of the re-sampled reference —
+    the kept region then decodes to the EXACT original material, not a re-render.
     """
     dev = "cuda"
-    flow = pipeline.models["tex_slat_flow_model_1024"]
+    grid = res // 16
+    flow = pipeline.models[f"tex_slat_flow_model_{res}"]
     params = pipeline.tex_slat_sampler_params
     s_mean, s_std = _norm_pair(pipeline.shape_slat_normalization, dev)
     t_mean, t_std = _norm_pair(pipeline.tex_slat_normalization, dev)
@@ -275,9 +293,84 @@ def masked_tex_slat(
             flow.cpu()
         return out * t_std + t_mean
 
+    _restore = (anchor_mode == "posthoc" and before_tex_denorm is not None
+                and before_tex_denorm.shape[0] == coords0.shape[0])
+    if anchor_mode == "posthoc" and before_tex_denorm is not None and not _restore:
+        logger.warning("[s5/S2] tex restore skipped: before_tex rows (%d) != "
+                       "coords0 (%d) — falling back to re-sampled posthoc",
+                       int(before_tex_denorm.shape[0]), int(coords0.shape[0]))
+    if _restore:
+        # RESTORE-style (mirrors S1 restore_preserved): generate the whole
+        # material field FREELY under the edited image + edited shape, then
+        # hard-paste the P1-ENCODED *original* tex latent onto the preserved
+        # tokens — so the kept region decodes to the EXACT original material
+        # (not a re-rendered guess).  No reference re-sample, no inversion.
+        preserved, src_idx = build_coord_bridge(coords0, coords_new, edit_grid64, grid=grid)
+        preserved, src_idx = preserved.to(dev), src_idx.to(dev)
+        before = before_tex_denorm.to(dev).float()
+        before_norm = (before - t_mean) / t_std
+        if pipeline.low_vram:
+            flow.to(dev)
+        feats_init = torch.randn(coords_new.shape[0], tex_dim, device=dev)
+        x_init = shape_new_norm.replace(feats_init)
+        logger.info("[s5/S2] tex anchor_mode=posthoc-restore (free gen + paste "
+                    "BEFORE-encoded tex, %d/%d preserved tokens)",
+                    int(preserved.sum()), coords_new.shape[0])
+        out = sampler.sample(
+            flow, x_init,
+            cond=cond_edit["cond"], neg_cond=cond_edit["neg_cond"],
+            steps=steps, rescale_t=rescale_t,
+            guidance_strength=gs, guidance_interval=gi, guidance_rescale=grescale,
+            concat_cond=shape_new_norm,
+            verbose=False, tqdm_desc="tex (posthoc-restore)",
+            x_init=x_init, step_callback=None,
+        ).samples
+        new_feats = out.feats.clone()
+        new_feats[preserved] = before_norm[src_idx]
+        out = out.replace(new_feats)
+        if pipeline.low_vram:
+            flow.cpu()
+        return out * t_std + t_mean
+
     # 1. reference: original-image texture on C0 (conditioned on original shape)
     tex0 = pipeline.sample_tex_slat(cond_orig, flow, shape0_denorm, {})
     tex0_norm = (tex0 - t_mean) / t_std
+
+    preserved, src_idx = build_coord_bridge(coords0, coords_new, edit_grid64, grid=grid)
+    preserved, src_idx = preserved.to(dev), src_idx.to(dev)
+
+    if anchor_mode == "posthoc":
+        # Free (vanilla-quality) generation of the whole material field under the
+        # EDITED image + edited shape, then HARD-OVERWRITE the preserved tokens
+        # with the ORIGINAL-image reference texture (``tex0``) at the end.  This
+        # gives exact body material (no edited-image colour/lighting drift bleeding
+        # into the kept region, no inverted-original neighbours dragging the edit)
+        # + a clean edit region.  Mirrors shape ``posthoc``; possible 1-voxel
+        # boundary seam (use ``contact_soft`` if that matters).  No inversion
+        # needed (we paste the clean ``tex0``, not an inverted trajectory) → also
+        # skips the costly invert_clean pass.
+        if pipeline.low_vram:
+            flow.to(dev)
+        feats_init = torch.randn(coords_new.shape[0], tex_dim, device=dev)
+        x_init = shape_new_norm.replace(feats_init)
+        logger.info("[s5/S2] tex anchor_mode=posthoc (free gen + final body paste, "
+                    "%d/%d preserved tokens)", int(preserved.sum()),
+                    coords_new.shape[0])
+        out = sampler.sample(
+            flow, x_init,
+            cond=cond_edit["cond"], neg_cond=cond_edit["neg_cond"],
+            steps=steps, rescale_t=rescale_t,
+            guidance_strength=gs, guidance_interval=gi, guidance_rescale=grescale,
+            concat_cond=shape_new_norm,
+            verbose=False, tqdm_desc="tex (posthoc)",
+            x_init=x_init, step_callback=None,
+        ).samples
+        new_feats = out.feats.clone()
+        new_feats[preserved] = tex0_norm.feats[src_idx]
+        out = out.replace(new_feats)
+        if pipeline.low_vram:
+            flow.cpu()
+        return out * t_std + t_mean
 
     if pipeline.low_vram:
         flow.to(dev)
@@ -291,8 +384,6 @@ def masked_tex_slat(
     )
 
     # 3. masked forward on coords_new under EDITED image + edited shape
-    preserved, src_idx = build_coord_bridge(coords0, coords_new, edit_grid64)
-    preserved, src_idx = preserved.to(dev), src_idx.to(dev)
     feats_init = torch.randn(coords_new.shape[0], tex_dim, device=dev)
     feats_init[preserved] = inv[1.0].feats[src_idx]
     x_init = shape_new_norm.replace(feats_init)

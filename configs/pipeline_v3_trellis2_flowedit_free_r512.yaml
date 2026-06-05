@@ -1,0 +1,155 @@
+# =====================================================================
+# Pipeline v3 — TRELLIS.2, 512 edit-resolution experiment (FlowEdit + free)
+# =====================================================================
+# Recipe-named (was *_glbrender_e512): "glb" only described the render source,
+# not the edit recipe — this tree IS FlowEdit S1 + free S2.
+# A/B sibling of pipeline_v3_trellis2_flowedit_free_r1024.yaml (FlowEdit S1 + free
+# S2, recipe R4) but at **512 edit resolution** instead of 1024:
+#
+#   * S2 SLat uses shape/tex_slat_flow_model_512 on 32³ coords (= res//16);
+#     conds @512; decode_latent(.,.,512).  S1 (SS structure) is unchanged — the
+#     TRELLIS.1 SS VAE is fixed 64³→16³; coords_new is max-pooled 64³→32³ for S2.
+#   * The S2 body anchor needs the grid-512 (32³) re-encode of the mesh, written
+#     by the encode stage as p1_encode/shape_slat_e512.npz + tex_slat_e512.npz
+#     (the canonical 64³ shape_slat.npz still drives S1).
+#
+# Single master knob: trellis2_edit_res: 512 (read by encode + 3D-edit stages).
+#
+# Pre-3D stages (flux/gate/overview) are REUSED from _exp_flowedit_free_r1024 by seeding this
+# tree (symlink edits_2d/phase1/gate_views, copy edit_status.json); only the
+# encode (grid-512 sidecar) + trellis2_preview re-run here.  Compare against the
+# 1024 result in _exp_flowedit_free_r1024/.../edits_3d.
+#
+# Run (only the two GPU stages; upstream already seeded):
+#   OBJ_IDS_FILE=data/Pxform_v2/_exp_flowedit_free_r512/seeded_ids.txt FORCE=1 \
+#   STAGES=trellis2_encode,trellis2_preview \
+#   MACHINE_ENV=configs/machine/local_trellis2.env \
+#     bash run_pipeline_v3_shard_trellis2.sh shard08_flowedit_e512 \
+#          configs/pipeline_v3_trellis2_flowedit_free_r512.yaml
+# =====================================================================
+
+blender: /mnt/zsn/zsn_workspace/VoxHammer/third_party/blender-4.2.19-linux-x64/blender
+ckpt_root: /mnt/zsn/ckpts/TRELLIS.2-4B
+
+data:
+  output_dir: data/Pxform_v2/_exp_flowedit_free_r512   # 512-edit FlowEdit+free sibling of _exp_flowedit_free_r1024
+  mesh_root:   data/partverse/inputs/mesh
+  images_root: data/partverse/inputs/images
+
+pipeline:
+  gpus: [0, 1, 2, 3, 4, 5, 6, 7]   # all 8 GPUs → 8-way parallel 3D edit
+
+  vlm_port_base: 8200
+  vlm_port_stride: 1
+  flux_port_base: 8020
+  flux_port_stride: 1
+
+  prerender_workers: 6
+  s6p_del_workers: 6
+
+  stages:
+  - name: trellis2_encode
+    desc: >
+      TRELLIS.2 P1 — encode the ORIGINAL mesh.  With trellis2_edit_res=512 this
+      ALSO writes the grid-512 sidecar (shape/tex_slat_e512.npz, 32³) used as the
+      S2 body anchor.  The canonical 64³ encode still drives S1.
+    servers: none
+    use_gpus: true
+    steps:
+    - trellis2_encode
+
+  - name: text_gen_gate_a
+    desc: VLM edit generation (Mode A overview) + text-align gate.
+    servers: vlm
+    steps:
+    - gen_edits
+    - gate_text_align
+
+  - name: flux_2d
+    desc: FLUX 2D image editing.
+    servers: flux
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 0
+    steps:
+    - flux_2d
+
+  - name: gate_2d
+    desc: Gate C — VLM judges each FLUX before→after pair.
+    servers: vlm
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 1
+    steps:
+    - gate_2d
+
+  - name: trellis2_preview
+    desc: >
+      TRELLIS.2 masked latent editing at 512 → edits_3d/<edit_id> latents +
+      gate-E before/after named views (PbrMeshRenderer, white bg).
+    servers: none
+    use_gpus: true
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 2
+    steps:
+    - trellis2_3d
+
+services:
+  vlm:
+    model: /mnt/zsn/ckpts/Qwen3.6-27B
+
+  image_edit:
+    enabled: true
+    image_edit_backend: local_diffusers
+    workers_per_server: 2
+
+    trellis2_codebase: /mnt/zsn/3dobject/TRELLIS.2
+    trellis2_ckpt:     /mnt/zsn/ckpts/TRELLIS.2-4B
+
+    use_mask: true
+
+    # 512 edit resolution (vs 1024 in _exp_flowedit_free_r1024).  Same recipe R4 otherwise:
+    # FlowEdit S1 (symmetric CFG, canonical frame) + free S2.
+    trellis2_edit_res: 512
+    trellis2_canonical_frame: true
+    trellis2_s1_mode: flowedit
+    trellis2_s2_anchor_mode: free
+
+    trellis2_pipeline_type: 1024_cascade
+    trellis2_seed: 1
+    trellis2_num_samples: 1
+    trellis2_decimation_target: 1000000
+    trellis2_texture_size: 4096
+    emit_before: true
+
+    trellis2_emit_glb: false
+
+    trellis2_render_gate_views: true
+    trellis2_gate_view_res: 512
+    # Overview already exists (reused from _exp_flowedit_free_r1024 via symlink) — don't load
+    # the decode pipeline at encode just to re-render it.
+    trellis2_encode_render_overview: false
+
+    trellis_workers_per_gpu: 1
+
+qc:
+  edit_types: [modification, scale]
+
+  thresholds_by_type:
+    deletion:
+      min_visual_quality: 3
+    modification:
+      min_visual_quality: 3
+      require_preserve_other: true
+    scale:
+      min_visual_quality: 3
+      require_preserve_other: true
+    material:
+      min_visual_quality: 3
+    color:
+      min_visual_quality: 3
+    global:
+      min_visual_quality: 3
+    addition:
+      min_visual_quality: 3

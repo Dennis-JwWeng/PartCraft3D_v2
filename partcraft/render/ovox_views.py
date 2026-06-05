@@ -209,14 +209,18 @@ def render_sample(
     resolution: int = 512,
     ssaa: int = 2,
     key: str = "shaded",
+    bg: tuple[float, float, float] | None = (1.0, 1.0, 1.0),
+    transformation=None,
     device: str = "cuda",
 ) -> dict[str, np.ndarray]:
     """Render a decoded TRELLIS sample (Mesh / MeshWithVoxel) at named views.
 
     Returns ``{name: RGB uint8 [H,W,3]}`` for the requested ``key`` channel
     (``shaded`` = textured PBR render, ``normal`` = normals).  Uses TRELLIS
-    ``render_frames`` (the same PbrMeshRenderer as the previews), so the "after"
-    lands on the SAME named cameras as the o-voxel "before".
+    ``render_frames`` (the same PbrMeshRenderer), so the "after" lands on the
+    SAME named cameras as the "before".  When ``bg`` is given (default white),
+    the object is composited onto that background using the render mask — so
+    gate-E gets the overview-style white bg.
 
     A textured ``MeshWithVoxel`` / ``MeshWithPbrMaterial`` needs an ``envmap``
     (see :func:`load_envmap`) for the shaded channel.
@@ -226,13 +230,27 @@ def render_sample(
     view_names = list(view_names or VIEW_ORDER)
     extr, intr = named_cameras(view_names, device=device)
     kw = {} if envmap is None else {"envmap": envmap}
+    if transformation is not None:
+        t = transformation
+        if not torch.is_tensor(t):
+            t = torch.from_numpy(np.asarray(t, np.float32))
+        kw["transformation"] = t.float().to(device)
     rets = render_utils.render_frames(
         sample, extr, intr,
         {"resolution": resolution, "ssaa": ssaa},
         verbose=False, **kw)
     chan = key if key in rets else ("shaded" if "shaded" in rets else next(iter(rets)))
     frames = rets[chan]
-    return {nm: frames[k] for k, nm in enumerate(view_names)}
+    masks = rets.get("mask") or rets.get("alpha")
+    out: dict[str, np.ndarray] = {}
+    for k, nm in enumerate(view_names):
+        img = frames[k]
+        if bg is not None and masks is not None:
+            m = masks[k].astype(np.float32) / 255.0
+            bg_arr = np.array(bg, np.float32) * 255.0
+            img = (img.astype(np.float32) * m + bg_arr * (1.0 - m)).clip(0, 255).astype(np.uint8)
+        out[nm] = img
+    return out
 
 
 __all__ = [

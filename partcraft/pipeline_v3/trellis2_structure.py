@@ -60,6 +60,28 @@ def get_ss_encoder(pipeline, p25_cfg: dict, logger):
 
 
 @torch.no_grad()
+@torch.no_grad()
+def ss_roundtrip_occupancy(pipeline, ss_enc, coords0: torch.Tensor,
+                           dev: str = "cuda") -> torch.Tensor:
+    """Pre-edit occupancy in the SS-decoder frame: ``ss_dec(ss_enc(occ)) > 0``.
+
+    Pure SS-VAE roundtrip (NO flow), so it is identical for any SS flow model
+    (T1 or T2) — the same-frame reference an occupancy-restore unions against
+    when the edited ``coords_new`` came from an external/precomputed flow.
+    Returns ``[M,3]`` int voxel indices (0..63).
+    """
+    ss_dec = pipeline.models["sparse_structure_decoder"]
+    c = coords0.long().to(dev)
+    occ = torch.zeros(1, 1, 64, 64, 64, device=dev)
+    occ[0, 0, c[:, 0], c[:, 1], c[:, 2]] = 1.0
+    if pipeline.low_vram:
+        ss_dec.to(dev)
+    dec = ss_dec(ss_enc(occ.float())) > 0
+    if pipeline.low_vram:
+        ss_dec.cpu()
+    return torch.argwhere(dec)[:, [0, 2, 3, 4]][:, 1:].int().cpu()
+
+
 def edit_structure(
     pipeline,
     ss_enc,
@@ -74,8 +96,15 @@ def edit_structure(
     contact_mask: torch.Tensor | None = None,
     contact_sigma: float | None = None,
     ss_param_override: dict | None = None,
+    return_orig_occ: bool = False,
+    ss_flow=None,
 ) -> torch.Tensor:
     """Masked-edit the sparse structure; return ``coords_new`` ``[M,3]`` int (0..63).
+
+    ``return_orig_occ`` also decodes the ORIGINAL SS latent ``z_s0`` through the
+    SAME ``ss_dec`` and returns ``(coords_new, coords_orig)`` — ``coords_orig`` is
+    the pre-edit occupancy in the *same decoder frame* as ``coords_new`` (NOT the
+    shape-VAE sidecar), so an occupancy-restore can union them without misalignment.
 
     Args:
         pipeline:    Trellis2ImageTo3DPipeline (provides ss flow/decoder + params).
@@ -87,9 +116,15 @@ def edit_structure(
         cond_edit:   512-res image cond for the EDITED view (forward repaint).
         keep_thresh: 16³ block is 'edit' iff ≥ this fraction of its 64 cells are
                      in the 64³ edit region (higher → tighter S1 edit region).
+        ss_flow:     SS flow model to drive the edit; defaults to TRELLIS.2's own
+                     ``pipeline.models["sparse_structure_flow_model"]``.  Pass the
+                     TRELLIS.1 flow (see ``trellis1_ss.load_t1_ss_flow``) — with T1
+                     image conds in ``cond_orig/cond_edit`` — to run the T1-SS edit
+                     in-process (the SS VAE / decoder are shared regardless).
     """
     dev = "cuda"
-    ss_flow = pipeline.models["sparse_structure_flow_model"]
+    if ss_flow is None:
+        ss_flow = pipeline.models["sparse_structure_flow_model"]
     ss_dec = pipeline.models["sparse_structure_decoder"]
     # SS sampler params: ckpt default (steps12/cfg7.5/interval[.6,1]/rt5),
     # optionally overridden — e.g. to benchmark against TRELLIS.1's gentler
@@ -166,6 +201,8 @@ def edit_structure(
     if pipeline.low_vram:
         ss_dec.to(dev)
     decoded = ss_dec(z_s_new) > 0
+    # same-frame pre-edit occupancy (decode the ORIGINAL latent via the SAME dec)
+    decoded0 = (ss_dec(z_s0) > 0) if return_orig_occ else None
     if pipeline.low_vram:
         ss_dec.cpu()
     # argwhere → (b, c, x, y, z); keep (x, y, z)
@@ -184,6 +221,9 @@ def edit_structure(
             f"(edit region too large — likely scaling the main body). "
             f"Skipping this edit."
         )
+    if return_orig_occ:
+        coords_orig = torch.argwhere(decoded0)[:, [0, 2, 3, 4]][:, 1:].int().cpu()
+        return coords_new, coords_orig
     return coords_new
 
 

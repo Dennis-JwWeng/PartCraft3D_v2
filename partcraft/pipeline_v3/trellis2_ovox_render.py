@@ -495,6 +495,11 @@ def glb_to_pbr_mesh(
         uv = getattr(g.visual, "uv", None)
         uvf = (np.asarray(uv, np.float32)[f] if uv is not None
                else np.zeros((f.shape[0], 3, 2), np.float32))
+        # TRELLIS's PbrMeshRenderer (like its training data) expects v-flipped
+        # UVs; partverse glb UVs are not flipped → flip v, else the texture
+        # samples the (mostly empty/black) atlas and renders dark.
+        uvf = uvf.copy()
+        uvf[..., 1] = 1.0 - uvf[..., 1]
         mat = getattr(g.visual, "material", None)
         tex = None
         bct = getattr(mat, "baseColorTexture", None) if mat is not None else None
@@ -506,12 +511,26 @@ def glb_to_pbr_mesh(
         bcf = getattr(mat, "baseColorFactor", None) if mat is not None else None
         bcf = ([float(x) / 255.0 for x in np.asarray(bcf)[:3]]
                if bcf is not None else [1.0, 1.0, 1.0])
+        # metallic-roughness texture: glTF packs roughness in G, metallic in B.
+        mrt = getattr(mat, "metallicRoughnessTexture", None) if mat is not None else None
+        metal_tex = rough_tex = None
+        if mrt is not None:
+            mr = np.asarray(mrt.convert("RGB"), np.float32) / 255.0
+            metal_tex = Texture(torch.from_numpy(np.ascontiguousarray(mr[..., 2:3])),
+                                filter_mode=TextureFilterMode.LINEAR,
+                                wrap_mode=TextureWrapMode.REPEAT)
+            rough_tex = Texture(torch.from_numpy(np.ascontiguousarray(mr[..., 1:2])),
+                                filter_mode=TextureFilterMode.LINEAR,
+                                wrap_mode=TextureWrapMode.REPEAT)
         mf = getattr(mat, "metallicFactor", None) if mat is not None else None
         rf = getattr(mat, "roughnessFactor", None) if mat is not None else None
+        # glTF: factor defaults to 1.0 (multiplies the texture) when present.
+        metal_f = float(mf) if mf is not None else (1.0 if metal_tex is not None else 0.0)
+        rough_f = float(rf) if rf is not None else 1.0
         materials.append(PbrMaterial(
             base_color_texture=tex, base_color_factor=bcf,
-            metallic_factor=float(mf) if mf is not None else 0.0,
-            roughness_factor=float(rf) if rf is not None else 1.0,
+            metallic_texture=metal_tex, metallic_factor=metal_f,
+            roughness_texture=rough_tex, roughness_factor=rough_f,
             alpha_mode=AlphaMode.OPAQUE, alpha_cutoff=0.5))
         all_v.append(v); all_f.append(f + start)
         all_mid.append(np.full(f.shape[0], gi, np.int64)); all_uv.append(uvf)
@@ -553,6 +572,93 @@ def render_mesh_named_view(
     return d[view_name]
 
 
+# ───────────────── unified PBR overview (decode RGB + part-mesh seg) ─────────
+# Replaces the o-voxel overview: realistic RGB from decoded latents, and a flat
+# pure-colour part segmentation from the actual part meshes (captures thin
+# geometry like crib slats that o-voxel solid-blocks lose).  Both via TRELLIS's
+# native PbrMeshRenderer at the named views.
+
+def build_part_palette_mesh(mesh_npz: Path, M: np.ndarray,
+                            target_ids: Iterable[int] | None = None,
+                            device: str = "cuda"):
+    """Combined part-mesh, each part a solid material → flat segmentation.
+
+    ``target_ids=None`` → every part gets ``OVERVIEW_PALETTE[pid%16]`` (overview
+    segmentation).  Otherwise target parts are RED, the rest GREY (gate-A
+    highlight).  Render its ``base_color`` channel for a flat, geometry-accurate
+    map (occlusion via the renderer's z-buffer).
+    """
+    import trimesh
+    from trellis2.representations.mesh.base import MeshWithPbrMaterial, PbrMaterial, AlphaMode
+
+    parts = load_part_scenes(Path(mesh_npz))
+    tset = None if target_ids is None else set(int(t) for t in target_ids)
+    all_v, all_f, all_mid, materials = [], [], [], []
+    start = 0
+    for i, pid in enumerate(sorted(parts)):
+        groups, _ = _normalized_groups(parts[pid], M=M, fix_textures=False)
+        merged = trimesh.util.concatenate(groups)
+        v = torch.from_numpy(np.asarray(merged.vertices)).float()
+        f = torch.from_numpy(np.asarray(merged.faces)).long()
+        all_v.append(v); all_f.append(f + start)
+        all_mid.append(torch.full((f.shape[0],), i, dtype=torch.long)); start += v.shape[0]
+        if tset is None:
+            col = np.array(OVERVIEW_PALETTE[pid % len(OVERVIEW_PALETTE)], np.float32) / 255.0
+        else:
+            col = np.array(HIGHLIGHT_RED if pid in tset else HIGHLIGHT_GREY, np.float32) / 255.0
+        materials.append(PbrMaterial(base_color_factor=[float(x) for x in col],
+                                     metallic_factor=0.0, roughness_factor=1.0,
+                                     alpha_mode=AlphaMode.OPAQUE))
+    if not all_v:
+        return None
+    return MeshWithPbrMaterial(
+        vertices=torch.cat(all_v), faces=torch.cat(all_f),
+        material_ids=torch.cat(all_mid),
+        uv_coords=torch.zeros(torch.cat(all_f).shape[0], 3, 2),
+        materials=materials).to(device)
+
+
+def render_pbr_overview(pipeline, mesh_npz: Path, shape_slat, tex_slat, envmap,
+                        *, view_names: Sequence[str] | None = None,
+                        resolution: int = 512, decode_res: int = 1024,
+                        target_ids: Iterable[int] | None = None,
+                        device: str = "cuda"):
+    """Unified overview render.  Returns dict:
+      ``rgb``       {name: RGB}  decoded latents → PbrMeshRenderer 'shaded'
+      ``seg``       {name: RGB}  part-mesh palette → 'base_color' (flat)
+      ``highlight`` {name: RGB}  part-mesh red/grey (only if target_ids)
+      ``cam``/``M``/``part_ids``
+    """
+    from partcraft.render import ovox_views as _ov
+
+    views = list(view_names or _ov.VIEW_ORDER)
+    decoded = pipeline.decode_latent(shape_slat, tex_slat, decode_res)[0]
+    # decoded mesh and the part-mesh segmentation are encoded/normalized with the
+    # SAME canonical _CANON_ROT (Y-up→Z-up), so both already sit in ONE frame —
+    # render both straight through render_sample at the named cameras, no extra
+    # transform.  (A rotation on only one side is what tipped RGB vs seg before.)
+    rgb = _ov.render_sample(decoded, views, envmap=envmap, resolution=resolution,
+                            key="shaded", bg=(1, 1, 1), device=device)
+
+    scene = load_full_scene(Path(mesh_npz))
+    _, M = _normalized_groups(scene, canonical=True)
+    part_ids = sorted(load_part_scenes(Path(mesh_npz)).keys())
+
+    def _seg(tids):
+        m = build_part_palette_mesh(mesh_npz, M, target_ids=tids, device=device)
+        if m is None:
+            white = (np.ones((resolution, resolution, 3), np.uint8) * 255)
+            return {v: white.copy() for v in views}
+        return _ov.render_sample(m, views, envmap=envmap, resolution=resolution,
+                                 key="base_color", bg=(1, 1, 1), device=device)
+
+    out = {"rgb": rgb, "seg": _seg(None), "cam": _ov.camera_transforms(views),
+           "M": M, "part_ids": part_ids}
+    if target_ids is not None:
+        out["highlight"] = _seg(target_ids)
+    return out
+
+
 def save_ovox(path: Path, coords: np.ndarray, attr: dict, grid_size: int) -> None:
     """Persist the coloured o-voxel so downstream stages reuse one voxelisation."""
     path = Path(path)
@@ -575,6 +681,9 @@ __all__ = [
     "render_object_multiview",
     "render_overview_from_ovox",
     "render_mesh_named_view",
+    "glb_to_pbr_mesh",
+    "build_part_palette_mesh",
+    "render_pbr_overview",
     "OVERVIEW_PALETTE",
     "save_ovox",
 ]

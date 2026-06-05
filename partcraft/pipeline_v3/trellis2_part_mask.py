@@ -306,17 +306,19 @@ def part_edit_grid_64(
     mesh_npz_path: Path,
     target_part_ids: Iterable[int],
     *,
-    pad: int = 3,
+    pad: int = 0,
     full_mesh_for_normalize: bool = True,
     canonical: bool = False,
     subtract_preserved: bool = False,
 ) -> torch.Tensor:
     """Dense ``[64,64,64]`` bool edit region for the *structure* stage.
 
-    The target parts are voxelized at 64³ then dilated by ``pad`` cells so the
-    S1 repaint has empty room to generate a part of a different size/shape
-    (mirrors v1 ``_compute_editing_region(..., pad=3)``).  Independent of the
-    current active-voxel set, so newly-grown voxels are permitted.
+    The target parts are voxelized at 64³ and (when ``pad>0``) dilated by
+    ``pad`` cells so the S1 repaint has empty room to generate a part of a
+    different size/shape (Chebyshev box growth; v1 used ``pad=3``).  The
+    default ``pad=0`` keeps the region == the raw part-id mask (no dilation).
+    Independent of the current active-voxel set, so newly-grown voxels are
+    permitted.
 
     ``canonical`` is forwarded to :func:`_target_block_keys_64` so the region
     matches canonical-frame coords0 when canonical encoding is on.
@@ -391,15 +393,49 @@ def edit_grid_64_to_keep16_soft(
     return torch.maximum(keep, blur).clamp(0.0, 1.0)
 
 
+def coord_keys(coords3: torch.Tensor, grid: int = GRID_LO) -> torch.Tensor:
+    """[N,3] int voxel indices (0..grid-1) → [N] int64 flat keys."""
+    return _coords3_to_key(coords3.long(), grid)
+
+
 def coord_keys_64(coords3: torch.Tensor) -> torch.Tensor:
-    """[N,3] int voxel indices (0..63) → [N] int64 flat keys."""
-    return _coords3_to_key(coords3.long(), GRID_LO)
+    """[N,3] int voxel indices (0..63) → [N] int64 flat keys (back-compat wrapper)."""
+    return coord_keys(coords3, GRID_LO)
+
+
+def downsample_coords(coords3: torch.Tensor, factor: int) -> torch.Tensor:
+    """Coarsen ``[N,3]`` int voxel indices by integer ``factor`` → unique ``[M,3]`` int32.
+
+    Used to bring the 64³ S1 occupancy / ``coords_new`` down to the SLat coord
+    grid the ``_512`` flow models expect (32³ for edit_res=512, factor=2).
+    """
+    if factor <= 1:
+        return coords3.int()
+    c = coords3.long()
+    if c.shape[1] == 4:
+        c = c[:, 1:]
+    return torch.unique(c // factor, dim=0).to(torch.int32)
+
+
+def downsample_edit_grid(grid64: torch.Tensor, factor: int) -> torch.Tensor:
+    """Max-pool a dense ``[64,64,64]`` bool edit grid by ``factor`` → ``[G,G,G]`` bool.
+
+    A coarse cell is 'edit' if ANY of its ``factor³`` fine cells are — matching
+    the ``downsample_coords`` (union) semantics so the bridge edit mask and the
+    downsampled coords agree.
+    """
+    if factor <= 1:
+        return grid64.bool()
+    import torch.nn.functional as F
+    out = F.max_pool3d(grid64.float()[None, None], kernel_size=factor, stride=factor)
+    return (out[0, 0] > 0)
 
 
 def build_coord_bridge(
     coords0: torch.Tensor,
     coords_new: torch.Tensor,
     edit_grid64: torch.Tensor,
+    grid: int = GRID_LO,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Map preserved tokens between original coords ``C0`` and edited ``C1``.
 
@@ -422,8 +458,8 @@ def build_coord_bridge(
     coords0 = coords0.long().to(dev)
     coords_new = coords_new.long().to(dev)
     edit_grid64 = edit_grid64.to(dev)
-    k0 = coord_keys_64(coords0)
-    k1 = coord_keys_64(coords_new)
+    k0 = coord_keys(coords0, grid)
+    k1 = coord_keys(coords_new, grid)
     edit_at = edit_grid64[coords_new[:, 0], coords_new[:, 1], coords_new[:, 2]]
     order = torch.argsort(k0)
     k0s = k0[order]
@@ -438,6 +474,7 @@ def incore_edit_bridge(
     coords0: torch.Tensor,
     coords_new: torch.Tensor,
     edit_grid64: torch.Tensor,
+    grid: int = GRID_LO,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Tokens present in BOTH ``C0`` and the edit region → ``(mask[N1], src[P])``.
 
@@ -451,8 +488,8 @@ def incore_edit_bridge(
     coords0 = coords0.long().to(dev)
     coords_new = coords_new.long().to(dev)
     edit_grid64 = edit_grid64.to(dev)
-    k0 = coord_keys_64(coords0)
-    k1 = coord_keys_64(coords_new)
+    k0 = coord_keys(coords0, grid)
+    k1 = coord_keys(coords_new, grid)
     edit_at = edit_grid64[coords_new[:, 0], coords_new[:, 1], coords_new[:, 2]]
     order = torch.argsort(k0)
     k0s = k0[order]
@@ -461,6 +498,59 @@ def incore_edit_bridge(
     warm_new = in_c0 & edit_at
     src_index = order[pos[warm_new]]
     return warm_new, src_index
+
+
+def restore_preserved_occupancy(
+    coords0: torch.Tensor,
+    coords_new: torch.Tensor,
+    edit_grid: torch.Tensor,
+    grid: int = GRID_LO,
+) -> tuple[torch.Tensor, int]:
+    """Re-insert source voxels dropped from the PRESERVED (non-edit) region.
+
+    The S1 edit (esp. with ``pad>0`` dilation + the 16³ keep-mask downsample)
+    can erode body voxels just outside the part: a source voxel that lies
+    OUTSIDE the edit region but is ABSENT from ``coords_new`` was lost.  We union
+    those back so the body occupancy stays complete; since they live outside the
+    edit region they are re-classified ``preserved`` by :func:`build_coord_bridge`
+    and anchored to the inverted source latent — so occupancy AND feats are
+    restored together (and ``posthoc`` body-paste covers them).  Voxels inside
+    the edit region (the part) are left untouched, so the part still grows freely.
+
+    Args:
+        coords0:    ``[N0,3]`` (or ``[N0,4]``) source slat occupancy on ``grid``.
+        coords_new: ``[N1,3]`` (or ``[N1,4]``) edited occupancy on ``grid``.
+        edit_grid:  dense ``[grid,grid,grid]`` bool edit region.
+        grid:       coord resolution (64 for 1024-edit, 32 for 512-edit).
+
+    Returns:
+        ``(coords_union[M,3] int32, n_restored)`` on ``coords_new``'s device.
+    """
+    dev = coords_new.device
+    c0 = coords0.long().to(dev)
+    c0 = c0[:, 1:] if c0.shape[1] == 4 else c0
+    cn = coords_new.long().to(dev)
+    cn = cn[:, 1:] if cn.shape[1] == 4 else cn
+    eg = edit_grid.to(dev).bool()
+    # source voxels OUTSIDE the edit region (the body we must keep intact)
+    in_edit0 = eg[c0[:, 0], c0[:, 1], c0[:, 2]]
+    pres0 = c0[~in_edit0]
+    if pres0.numel() == 0:
+        return cn.to(torch.int32), 0
+    # which of those are MISSING from coords_new (membership via sorted keys)
+    k_new = coord_keys(cn, grid)
+    k_pres = coord_keys(pres0, grid)
+    k_new_sorted, _ = torch.sort(k_new)
+    pos = torch.searchsorted(k_new_sorted, k_pres).clamp(
+        max=max(k_new_sorted.numel() - 1, 0))
+    present = ((k_new_sorted[pos] == k_pres) if k_new_sorted.numel()
+               else torch.zeros_like(k_pres, dtype=torch.bool))
+    missing = pres0[~present]
+    if missing.numel() == 0:
+        return cn.to(torch.int32), 0
+    out = torch.cat([cn, missing], dim=0)
+    out = torch.unique(out, dim=0)
+    return out.to(torch.int32), int(missing.shape[0])
 
 
 def densify_edit_occupancy(
@@ -504,8 +594,12 @@ __all__ = [
     "part_edit_grid_64",
     "edit_grid_64_to_keep16",
     "edit_grid_64_to_keep16_soft",
+    "coord_keys",
     "coord_keys_64",
+    "downsample_coords",
+    "downsample_edit_grid",
     "build_coord_bridge",
     "incore_edit_bridge",
+    "restore_preserved_occupancy",
     "densify_edit_occupancy",
 ]

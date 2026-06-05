@@ -1,15 +1,11 @@
 """Step s5 (trellis2 variant) — image-driven 3D regeneration via TRELLIS.2.
 
-Parallel to ``trellis_3d.py`` but uses the TRELLIS.2 image-to-3D pipeline
-instead of v1's SLAT-space Flow Inversion / mask repaint. Because v2 does
-not expose a latent editing API, the "edit" here is implemented as a full
-re-generation from the FLUX-edited 2D image:
+Parallel to ``trellis_3d.py`` but uses the TRELLIS.2 cascade. The "edit" is
+masked latent editing (Vinedresser3D-style: RF-invert the original view to
+anchor the preserved region, re-flow only the edited part), implemented in
+:func:`_build_p4_mesh`:
 
-    edits_2d/{edit_id}_edited.png ──► Trellis2ImageTo3DPipeline.run ──► mesh ──► after.glb
-
-For symmetry with the v1 contract, the original view image is also
-re-generated to produce ``before.glb`` (you may turn this off via
-``p25_cfg['emit_before'] = False`` to halve runtime).
+    edits_2d/{edit_id}_{input,edited}.png ──► _build_p4_mesh ──► mesh ──► after.glb
 
 Outputs per edit_id::
 
@@ -48,6 +44,31 @@ from .edit_status_io import edit_needs_step, update_edit_stage, obj_needs_stage
 # regenerate from the edited 2D image. We keep the same GPU_TYPES set so
 # the stage gating logic upstream still selects the same edits.
 GPU_TYPES = frozenset({"modification", "scale", "material", "global"})
+
+
+_WEBP_OK: bool | None = None   # cached once-per-process webp probe
+
+
+def _webp_textures_work() -> bool:
+    """Probe whether this env's Pillow can actually encode WEBP.
+
+    The trellis2 env ships a tangled Pillow (pip metadata 12.2.0 but on-disk
+    PIL 9.5.0.post2 with a mismatched ``_webp`` C ext — ``WebPEncode`` takes 9
+    args while the Python layer passes 11), so every ``glb.export(..., webp)``
+    throws and falls back to PNG.  Probe ONCE in-memory and cache it so we skip
+    the doomed webp attempt on every edit; auto-recovers if Pillow is fixed.
+    """
+    global _WEBP_OK
+    if _WEBP_OK is None:
+        try:
+            import io
+            from PIL import Image
+            buf = io.BytesIO()
+            Image.new("RGB", (8, 8)).save(buf, "WEBP", quality=80)
+            _WEBP_OK = True
+        except Exception:
+            _WEBP_OK = False
+    return _WEBP_OK
 
 
 @dataclass
@@ -124,40 +145,25 @@ def _partverse_reframe_matrix(mesh_npz: Path):
     return m
 
 
-def _run_and_export(pipeline, image, out_path: Path, p25_cfg: dict, logger,
-                    *, mesh_obj=None, reframe_mesh_npz: Path | None = None):
-    """Run trellis2 on a single PIL image and export GLB to ``out_path``.
+def _export_edit_glb(mesh_obj, out_path: Path, p25_cfg: dict, logger,
+                     *, reframe_mesh_npz: Path | None = None):
+    """Export a pre-built masked-edit mesh to GLB at ``out_path``.
 
-    If ``mesh_obj`` is given, skip the pipeline call and export that mesh
-    directly (used by the P4 branch which builds the mesh outside).
-
-    If ``reframe_mesh_npz`` is given, the exported GLB is rigidly transformed
-    from TRELLIS's canonical export frame back into the original full.glb
-    (partverse) world frame via :func:`_partverse_reframe_matrix`, so the
-    output shares one coordinate frame with the 2D condition and the edit mask.
+    The mesh is produced by :func:`_build_p4_mesh` (masked latent editing); this
+    helper only bakes + writes it.  If ``reframe_mesh_npz`` is given, the GLB is
+    rigidly transformed from TRELLIS's canonical export frame back into the
+    original full.glb (partverse) world frame via
+    :func:`_partverse_reframe_matrix`, so the output shares one coordinate frame
+    with the 2D condition and the edit mask.
     """
     import o_voxel  # type: ignore
 
-    pipeline_type = p25_cfg.get("trellis2_pipeline_type", "1024_cascade")
-    seed = int(p25_cfg.get("trellis2_seed", 1))
-    num_samples = int(p25_cfg.get("trellis2_num_samples", 1))
     decimation_target = int(p25_cfg.get("trellis2_decimation_target", 1_000_000))
     texture_size = int(p25_cfg.get("trellis2_texture_size", 4096))
     aabb = p25_cfg.get("trellis2_aabb",
                        [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]])
 
-    if mesh_obj is not None:
-        meshes = [mesh_obj]
-    else:
-        meshes = pipeline.run(
-            image,
-            pipeline_type=pipeline_type,
-            seed=seed,
-            num_samples=num_samples,
-        )
-    if not meshes:
-        raise RuntimeError("trellis2 returned no meshes")
-    mesh = meshes[0]
+    mesh = mesh_obj
     # nvdiffrast vertex-count cap.
     mesh.simplify(16_777_216)
 
@@ -188,11 +194,19 @@ def _run_and_export(pipeline, image, out_path: Path, p25_cfg: dict, logger,
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     webp = bool(p25_cfg.get("trellis2_extension_webp", True))
+    # This env's Pillow webp encoder is broken (see _webp_textures_work); probe
+    # once and skip straight to PNG so we don't throw + retry on every edit.
+    if webp:
+        first_probe = _WEBP_OK is None
+        if not _webp_textures_work():
+            if first_probe:
+                logger.info("[s5] webp unavailable in this Pillow build → "
+                            "exporting GLB with PNG textures")
+            webp = False
     try:
         glb.export(str(out_path), extension_webp=webp)
     except Exception as e:
-        # Some Pillow builds lack webp (no HAVE_WEBPANIM) — fall back to PNG
-        # textures so the GLB still writes.
+        # Fallback guard in case webp passes the probe but still fails at export.
         if webp:
             logger.warning("[s5] webp texture export failed (%s); "
                            "retrying with PNG textures", e)
@@ -202,28 +216,20 @@ def _run_and_export(pipeline, image, out_path: Path, p25_cfg: dict, logger,
     logger.info("[s5] wrote %s", out_path)
 
 
-def _load_view_image(spec, obj_record, p25_cfg: dict):
-    """Best-effort load of the original (un-edited) input image.
-
-    Falls back to None if the view cannot be resolved; the caller may
-    then skip the "before" export.
-    """
-    from PIL import Image  # noqa: F401  (used downstream via partcraft.pipeline_v3.edit_2d)
-    try:
-        from partcraft.pipeline_v3.edit_2d import prepare_input_image
-        if hasattr(spec, "npz_view") and spec.npz_view >= 0:
-            _, pil = prepare_input_image(obj_record, spec.npz_view)
-            return pil.convert("RGB")
-    except Exception:
-        pass
-    return None
-
-
 # ─────────────────── P4: masked sampling with P1 anchor ─────────────
 
-def _load_p1_slat(ctx: ObjectContext):
-    """Load this object's P1 shape SLat → (feats Tensor [N,32], coords [N,3])."""
-    p1_path = ctx.dir / "p1_encode" / "shape_slat.npz"
+def _load_p1_slat(ctx: ObjectContext, res: int = 1024, which: str = "shape"):
+    """Load this object's P1 ``{which}`` SLat → (feats Tensor [N,C], coords [N,3]).
+
+    ``which`` is ``"shape"`` or ``"tex"``.  ``res != 1024`` loads the grid-``res``
+    sidecar ``{which}_slat_e{res}.npz`` (re-encoded at grid ``res`` → ``res//16``³
+    coords) that the ``_{res}`` SLat flow models consume; ``1024`` loads the
+    canonical 64³ ``{which}_slat.npz``.  Shape and tex share coords (same order),
+    so a tex latent loaded this way aligns with the matching shape ``coords``.
+    """
+    stem = f"{which}_slat"
+    fname = f"{stem}.npz" if res == 1024 else f"{stem}_e{res}.npz"
+    p1_path = ctx.dir / "p1_encode" / fname
     if not p1_path.is_file():
         raise FileNotFoundError(
             f"P4 requires P1 encode output; missing: {p1_path}")
@@ -316,8 +322,18 @@ def _save_edit_latents(latents: dict, edit_dir: Path, logger):
 
 
 def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
-                   mesh_npz_path, p25_cfg, logger, white_model=False):
+                   mesh_npz_path, p25_cfg, logger, white_model=False,
+                   p1_feats_s2=None, p1_coords_s2=None, p1_tex_s2=None,
+                   edit_res=1024):
     """Masked 3-layer edit → MeshWithVoxel (same shape as ``pipeline.run()[0]``).
+
+    ``edit_res`` (1024 default / 512) sets the S2 SLat resolution.  S1 (the SS
+    structure stage) ALWAYS runs at 64³ — the TRELLIS.1 SS VAE is fixed 64³→16³,
+    and the native 512 pipeline just max-pools the decoded occupancy 64³→32³.  So
+    for ``edit_res=512`` we keep S1 on the 64³ body (``p1_feats``/``p1_coords3``),
+    then downsample ``coords_new``/``edit_grid`` 64³→32³ (``slat_grid=res//16``)
+    and feed S2 the grid-512 re-encoded body (``p1_feats_s2``/``p1_coords_s2``,
+    32³).  For 1024 the s2 body == the 64³ body and nothing is downsampled.
 
     Implements the Vinedresser3D idea on TRELLIS.2's three latents, routed by
     edit type (matching v1's ``edit_types``):
@@ -346,11 +362,29 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
     from partcraft.pipeline_v3 import trellis2_structure as t2s
     from partcraft.pipeline_v3 import trellis2_edit_stages as t2e
 
+    from partcraft.pipeline_v3.trellis2_part_mask import (
+        downsample_coords, downsample_edit_grid, restore_preserved_occupancy)
+
     dev = "cuda"
     sampler = MaskedFlowEulerGuidanceIntervalSampler(1e-5)
     edit_type = (getattr(spec, "edit_type", "") or "").lower()
     target_part_ids = list(getattr(spec, "selected_part_ids", []) or [])
-    coords0 = p1_coords3.int()
+    # S1 runs on the 64³ body; S2 on the grid-(edit_res) body (== 64³ for 1024).
+    slat_grid = edit_res // 16
+    factor = 64 // slat_grid
+    if p1_feats_s2 is None:
+        p1_feats_s2 = p1_feats
+    if p1_coords_s2 is None:
+        p1_coords_s2 = p1_coords3
+    coords0_s1 = p1_coords3.int()        # 64³ — S1 occupancy / edit_grid / keep16
+    coords0 = p1_coords_s2.int()         # slat_grid — S2 body anchor
+
+    def _to_s2(cn64, eg64):
+        """64³ coords_new + edit_grid → slat_grid (no-op when edit_res==1024)."""
+        if factor <= 1:
+            return cn64.to(dev), eg64.to(dev)
+        return (downsample_coords(cn64, factor).to(dev),
+                downsample_edit_grid(eg64, factor).to(dev))
     # Latent-retention bookkeeping (saved by run_for_object when
     # trellis2_save_latents is on).  edit_grid is set in both branches;
     # keep16 / s1_* only exist on the S1 (structure-edit) path.
@@ -370,22 +404,29 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
     # default S2 anchor from config; the structure path overrides to
     # "contact_soft" when the master switch is on (S2-only edits keep config).
     s2_anchor = str(p25_cfg.get("trellis2_s2_anchor_mode", "perstep"))
+    # Texture can use a different anchor than shape (e.g. shape=perstep for a
+    # solid edited part, tex=posthoc to hard-paste the original body material so
+    # the preserved region keeps its exact colour).  Defaults to the shape mode.
+    s2_tex_anchor = str(p25_cfg.get("trellis2_s2_tex_anchor_mode", s2_anchor))
 
     # ── conditioning: original (inversion) vs edited (forward) ────────
     orig_proc = pipeline.preprocess_image(orig_img)
     edit_proc = pipeline.preprocess_image(edited_img)
-    cond_orig_1024 = pipeline.get_cond([orig_proc], 1024)
-    cond_edit_1024 = pipeline.get_cond([edit_proc], 1024)
+    # S2 conds at the edit resolution (512 conds drive the _512 SLat flow models).
+    cond_orig_s2 = pipeline.get_cond([orig_proc], edit_res)
+    cond_edit_s2 = pipeline.get_cond([edit_proc], edit_res)
 
     # original shape latent (raw/denormalized) — reused as geometry reference
-    shape0 = t2e.sparse_denorm_shape(pipeline, p1_feats, coords0)
+    # (on the S2 grid: 64³ for 1024, 32³ for 512).
+    shape0 = t2e.sparse_denorm_shape(pipeline, p1_feats_s2, coords0)
 
     # ── TRELLIS.1-SS bridge (optional) ────────────────────────────────────
-    # Use externally-generated TRELLIS.1 occupancy (precomputed offline in the
-    # vinedresser3d env) as the SLat
-    # structure and run FREE (vanilla) S2 shape+tex on it — bypasses TRELLIS.2's
-    # masked S1 entirely.  Tests whether TRELLIS.1's SS flow gives cleaner
-    # geometry than TRELLIS.2's masked S1 (which over-inflates the edit region).
+    # Externally-generated TRELLIS.1 occupancy (precomputed offline in the
+    # vinedresser3d env, TRELLIS.1 SS flow) injected as ``coords_new``.  When set,
+    # it REPLACES the S1 sampler inside the main masked path below but keeps the
+    # SAME recipe (real edit_grid + same-frame restore + configured S2 anchor +
+    # edit_res), so it's a fair T1-vs-T2 SS-flow A/B (the only variable is the
+    # flow; SS VAE / edit region / restore / S2 are identical).
     ss1_dir = p25_cfg.get("trellis2_ss1_coords_dir", None)
     ss1_npz = None
     if ss1_dir:
@@ -393,20 +434,7 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
         if cand.is_file():
             ss1_npz = cand
 
-    if ss1_npz is not None and edit_type in S1_S2_TYPES:
-        import numpy as np
-        coords_new = torch.from_numpy(
-            np.load(ss1_npz, allow_pickle=True)["coords"].astype("int64")
-        ).int().to(dev)
-        edit_grid = torch.ones(64, 64, 64, dtype=torch.bool, device=dev)
-        s2_anchor = "free"
-        logger.info("[s5/P4] %s TRELLIS.1-SS bridge: %d voxels → free S2",
-                    spec.edit_id, coords_new.shape[0])
-        shape_new = t2e.masked_shape_slat(
-            pipeline, sampler, p1_feats, coords0, coords_new, edit_grid,
-            cond_orig_1024, cond_edit_1024, logger,
-            warmstart=False, nn_init=False, anchor_mode="free")
-    elif p25_cfg.get("trellis2_ss_vanilla", False) and edit_type in S1_S2_TYPES:
+    if p25_cfg.get("trellis2_ss_vanilla", False) and edit_type in S1_S2_TYPES:
         # Exp 2: TRELLIS.2's OWN SS flow in VANILLA whole-object mode (no mask),
         # then free S2 — the control that isolates "vanilla vs masked" (mechanism)
         # from "TRELLIS.1 vs TRELLIS.2" (model).  SS uses the 512-res edited cond.
@@ -415,20 +443,25 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
             cond_edit_512, 64, num_samples=1)
         coords_new = (cn[:, 1:] if cn.shape[1] == 4 else cn).int().to(dev)
         edit_grid = torch.ones(64, 64, 64, dtype=torch.bool, device=dev)
-        s2_anchor = "free"
+        s2_anchor = s2_tex_anchor = "free"   # whole-object vanilla: free shape AND tex
+        coords_new, edit_grid = _to_s2(coords_new, edit_grid)
         logger.info("[s5/P4] %s TRELLIS.2-vanilla-SS: %d voxels → free S2",
                     spec.edit_id, coords_new.shape[0])
         shape_new = t2e.masked_shape_slat(
-            pipeline, sampler, p1_feats, coords0, coords_new, edit_grid,
-            cond_orig_1024, cond_edit_1024, logger,
-            warmstart=False, nn_init=False, anchor_mode="free")
+            pipeline, sampler, p1_feats_s2, coords0, coords_new, edit_grid,
+            cond_orig_s2, cond_edit_s2, logger,
+            warmstart=False, nn_init=False, anchor_mode="free", res=edit_res)
     elif edit_type in S1_S2_TYPES and target_part_ids:
         # ── S1: edit structure → coords_new ───────────────────────────
         # Edit-region tightness knobs (the S1 SS latent is only 16³, so an
         # over-dilated / low-threshold region engulfs the whole part zone and
         # the structure repaint returns a coarse blob — see maskviz diag).
-        s1_pad = int(p25_cfg.get("trellis2_s1_pad", 3))
+        # Default pad=0: edit region == the raw part-id mask, NO dilation.
+        # Set trellis2_s1_pad>0 to re-enable Chebyshev box growth (v1 used 3).
+        s1_pad = int(p25_cfg.get("trellis2_s1_pad", 0))
         s1_thresh = float(p25_cfg.get("trellis2_s1_keep_thresh", 0.1))
+        restore_pres = bool(p25_cfg.get("trellis2_s2_restore_preserved", False))
+        coords_orig_ss = None  # same-frame pre-edit SS occupancy (masked path only)
         sub_pres = bool(p25_cfg.get("trellis2_mask_subtract_preserved",
                                     contact_soft))
         edit_grid = part_edit_grid_64(
@@ -441,7 +474,7 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
             from partcraft.pipeline_v3.trellis2_contact_mask import (
                 compute_contact_boundary)
             contact_64, c_ratio, s1_dyn, s2_dyn = compute_contact_boundary(
-                edit_grid, coords0, dev)
+                edit_grid, coords0_s1, dev)
             s1_cfg = p25_cfg.get("trellis2_s1_soft_sigma", None)
             s1_sigma_eff = float(s1_cfg) if s1_cfg is not None else s1_dyn
             # S2 deliberately does NOT use the contact soft mask.  A per-step
@@ -475,7 +508,26 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
         # edit_grid is still computed above and still drives the S2 coord bridge;
         # only the S1 *latent* edit changes.
         s1_mode = str(p25_cfg.get("trellis2_s1_mode", "masked")).lower()
-        if s1_mode == "flowedit":
+        # S1 SS *flow* model: "t2" (default, TRELLIS.2's own SS flow) or "t1"
+        # (TRELLIS.1's SS flow + DINOv2 cond, in-process — the native replacement
+        # for the old offline ss1_coords_dir bridge; see trellis1_ss.py).
+        s1_ss_model = str(p25_cfg.get("trellis2_s1_ss_model", "t2")).lower()
+        if ss1_npz is not None:
+            # TRELLIS.1-SS bridge: external occupancy REPLACES the S1 sampler,
+            # but the rest of the recipe (edit_grid above, restore below, S2
+            # anchor, edit_res) is identical to the T2 masked run → fair A/B.
+            import numpy as _np
+            coords_new = torch.from_numpy(
+                _np.load(ss1_npz, allow_pickle=True)["coords"].astype("int64")
+            ).int().to(dev)
+            logger.info("[s5/P4] %s TRELLIS.1-SS bridge: external %d voxels → "
+                        "recipe S2 (anchor=%s restore=%s res=%d)", spec.edit_id,
+                        coords_new.shape[0], s2_anchor, restore_pres, edit_res)
+            if restore_pres:
+                # same-frame reference is the SS-VAE roundtrip (flow-independent)
+                coords_orig_ss = t2s.ss_roundtrip_occupancy(
+                    pipeline, ss_enc, coords0_s1, dev).to(dev)
+        elif s1_mode == "flowedit":
             # gs_src defaults to gs_tgt (SYMMETRIC CFG): the edit drive should
             # come from the source→target CONDITION difference only, not a CFG
             # strength gap.  Asymmetric gs injects a spurious (pos−neg) push that
@@ -485,7 +537,7 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
             gs_tgt = float(p25_cfg.get("trellis2_s1_fe_gs_tgt", 7.5))
             gs_src = float(p25_cfg.get("trellis2_s1_fe_gs_src", gs_tgt))
             coords_new = t2s.flowedit_structure(
-                pipeline, ss_enc, sampler, coords0,
+                pipeline, ss_enc, sampler, coords0_s1,
                 cond_orig_512, cond_edit_512, logger,
                 gs_src=gs_src, gs_tgt=gs_tgt,
                 n_avg=int(p25_cfg.get("trellis2_s1_fe_navg", 1)),
@@ -493,16 +545,39 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
                 ss_param_override=(ss_override or None),
                 ).to(dev)
         else:
-            coords_new = t2s.edit_structure(
-                pipeline, ss_enc, sampler, coords0, edit_grid,
-                cond_orig_512, cond_edit_512, logger,
+            # T1-native: swap in TRELLIS.1's SS flow + DINOv2 conds (the SS VAE /
+            # masked machinery in edit_structure are shared).  T2 path unchanged.
+            t1_flow = None
+            c_orig_s1, c_edit_s1 = cond_orig_512, cond_edit_512
+            if s1_ss_model == "t1":
+                from partcraft.pipeline_v3 import trellis1_ss as t1ss
+                t1_flow = t1ss.load_t1_ss_flow(pipeline, p25_cfg, logger)
+                dino = t1ss.load_t1_dino(pipeline, logger)
+                rsess = t1ss.get_rembg_session(pipeline, logger)
+                c_orig_s1 = t1ss.t1_get_cond(dino, t1ss.t1_preprocess(orig_img, rsess), dev)
+                c_edit_s1 = t1ss.t1_get_cond(dino, t1ss.t1_preprocess(edited_img, rsess), dev)
+                if not ss_override:   # force T1's gentler schedule (== ss_align_t1)
+                    ss_override = {"steps": 25, "guidance_strength": 5.0,
+                                   "guidance_interval": [0.5, 1.0], "rescale_t": 3.0,
+                                   "guidance_rescale": 0.0}
+                logger.info("[s5/P4] %s S1 = TRELLIS.1 SS flow (in-process, native)",
+                            spec.edit_id)
+            _s1 = t2s.edit_structure(
+                pipeline, ss_enc, sampler, coords0_s1, edit_grid,
+                c_orig_s1, c_edit_s1, logger,
                 keep_thresh=s1_thresh,
                 soft_feather=float(p25_cfg.get("trellis2_s1_soft_feather", 0.0)),
                 contact_mask=contact_64, contact_sigma=s1_sigma_eff,
                 ss_param_override=(ss_override or None),
-                ).to(dev)
+                return_orig_occ=restore_pres, ss_flow=t1_flow)
+            if restore_pres:
+                coords_new, coords_orig_ss = _s1
+                coords_new = coords_new.to(dev)
+                coords_orig_ss = coords_orig_ss.to(dev)
+            else:
+                coords_new = _s1.to(dev)
         logger.info("[s5/P4] %s S1 structure: %d → %d voxels (parts=%s)",
-                    spec.edit_id, coords0.shape[0], coords_new.shape[0],
+                    spec.edit_id, coords0_s1.shape[0], coords_new.shape[0],
                     target_part_ids)
         keep16 = edit_grid_64_to_keep16(edit_grid, thresh=s1_thresh)
         # ── densify the edited region so flexicubes can CLOSE the surface ─
@@ -529,15 +604,31 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
             logger.info("[s5/P4] %s remove_small(<%d vox): %d → %d voxels",
                         spec.edit_id, s2_remove_small, n_before,
                         coords_new.shape[0])
-        # ── S2 geometry on coords_new ─────────────────────────────────
+        # ── restore preserved body occupancy lost to S1 — SAME-FRAME (64³ SS) ──
+        # Re-insert body voxels (outside the edit region) that the masked S1 edit
+        # dropped, using the PRE-EDIT SS occupancy decoded by the SAME ss_dec as
+        # the reference (coords_orig_ss) — NOT the shape-VAE sidecar (different
+        # encoder → misaligned/floating paste).  Done at 64³ before _to_s2 so the
+        # restored voxels are guaranteed adjacent to / aligned with coords_new.
+        if restore_pres and coords_orig_ss is not None:
+            n_before = coords_new.shape[0]
+            coords_new, n_restored = restore_preserved_occupancy(
+                coords_orig_ss, coords_new, edit_grid, grid=64)
+            coords_new = coords_new.to(dev)
+            logger.info("[s5/P4] %s S1 restore-preserved (64³ SS same-frame): "
+                        "+%d voxels (%d → %d)", spec.edit_id, n_restored,
+                        n_before, coords_new.shape[0])
+        # ── S2 geometry on coords_new (downsampled 64³→slat_grid for 512) ──
+        coords_new, edit_grid = _to_s2(coords_new, edit_grid)
         shape_new = t2e.masked_shape_slat(
-            pipeline, sampler, p1_feats, coords0, coords_new, edit_grid,
-            cond_orig_1024, cond_edit_1024, logger,
+            pipeline, sampler, p1_feats_s2, coords0, coords_new, edit_grid,
+            cond_orig_s2, cond_edit_s2, logger,
             warmstart=bool(p25_cfg.get("trellis2_s2_warmstart", False)),
             nn_init=bool(p25_cfg.get("trellis2_s2_nn_init", False)),
             anchor_mode=s2_anchor,
             anchor_cutoff=float(p25_cfg.get("trellis2_s2_anchor_cutoff", 0.3)),
-            contact_mask=contact_64, contact_sigma=s2_sigma_eff)
+            contact_mask=(contact_64 if factor == 1 else None),
+            contact_sigma=s2_sigma_eff, res=edit_res)
     else:
         # ── material / color / global: geometry preserved, coords fixed ──
         coords_new = coords0
@@ -548,6 +639,10 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
                                           pad=0, canonical=canonical).to(dev)
         else:
             edit_grid = torch.zeros(64, 64, 64, dtype=torch.bool, device=dev)
+        # coords_new == coords0 already lives on the S2 grid; bring the 64³
+        # edit_grid down to match (no-op for 1024).
+        if factor > 1:
+            edit_grid = downsample_edit_grid(edit_grid, factor).to(dev)
         shape_new = shape0   # reuse original geometry verbatim
         logger.info("[s5/P4] %s S2-only (%s): geometry locked, %d voxels",
                     spec.edit_id, edit_type, coords0.shape[0])
@@ -558,15 +653,17 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
         from partcraft.pipeline_v3.trellis2_white import build_white_model_mesh
         logger.info("[s5/P4] %s white-model — skipping texture stage",
                     spec.edit_id)
-        mesh = build_white_model_mesh(pipeline, shape_new, logger)
+        mesh = build_white_model_mesh(pipeline, shape_new, logger, res=edit_res)
     else:
         tex_new = t2e.masked_tex_slat(
             pipeline, sampler, shape0, shape_new, coords0, coords_new,
-            edit_grid, cond_orig_1024, cond_edit_1024, logger,
-            anchor_mode=s2_anchor,
-            contact_mask=contact_64, contact_sigma=s2_sigma_eff)
+            edit_grid, cond_orig_s2, cond_edit_s2, logger,
+            anchor_mode=s2_tex_anchor,
+            contact_mask=(contact_64 if factor == 1 else None),
+            contact_sigma=s2_sigma_eff, res=edit_res,
+            before_tex_denorm=p1_tex_s2)
         torch.cuda.empty_cache()
-        meshes = pipeline.decode_latent(shape_new, tex_new, 1024)
+        meshes = pipeline.decode_latent(shape_new, tex_new, edit_res)
         mesh = meshes[0]
     mesh.simplify(16_777_216)
 
@@ -607,18 +704,57 @@ def _get_envmap(p25_cfg: dict, logger):
 def _render_after_named_views(mesh_obj, pair_dir: Path, p25_cfg: dict, logger):
     """Render the decoded post-edit mesh at the named views → ``after_view_{name}.png``.
 
-    Shaded PBR render on the SAME named cameras as the o-voxel "before", so
-    gate-E compares like-for-like.  Consumes the in-memory decoded mesh (the
-    edited-latents result) — no GLB round-trip.
+    Shaded PBR render (PbrMeshRenderer + envmap, white bg) on the named cameras,
+    same renderer/lighting as the "before", so gate-E compares like-for-like.
+    Consumes the in-memory decoded mesh — no GLB round-trip.
     """
     from PIL import Image
     from partcraft.render import ovox_views as _ov
     env = _get_envmap(p25_cfg, logger)
-    res = int(p25_cfg.get("trellis2_after_view_res", 512))
-    imgs = _ov.render_sample(mesh_obj, envmap=env, resolution=res)
+    res = int(p25_cfg.get("trellis2_gate_view_res", 512))
+    imgs = _ov.render_sample(mesh_obj, envmap=env, resolution=res, bg=(1, 1, 1))
     for name, rgb in imgs.items():
         Image.fromarray(rgb).save(pair_dir / f"after_view_{name}.png")
     logger.info("[s5] %s rendered %d after-views", pair_dir.name, len(imgs))
+
+
+def _slat_from_npz(npz_path: Path):
+    """Reconstruct a SparseTensor from a saved p1 latent npz (feats, coords)."""
+    import numpy as _np
+    import torch
+    import trellis2.modules.sparse as sp
+    z = _np.load(str(npz_path))
+    feats = torch.from_numpy(z["feats"]).float().cuda()
+    c = torch.from_numpy(z["coords"]).int()
+    coords = torch.cat([torch.zeros(c.shape[0], 1, dtype=torch.int32), c], 1).cuda()
+    return sp.SparseTensor(feats=feats, coords=coords)
+
+
+def _render_before_named_views(pipeline, ctx, gate_dir: Path, p25_cfg: dict, logger):
+    """Render the ORIGINAL mesh at the named views → ``before_view_{name}.png``.
+
+    Fully latents-level (no glb): decode the p1-encoded shape+tex SLat →
+    MeshWithVoxel → SAME PbrMeshRenderer + envmap + white bg as the "after".
+    So before/after are the same source (both ``decode_latent`` outputs).
+    """
+    from PIL import Image
+    from partcraft.render import ovox_views as _ov
+    # Decode the ORIGINAL at the edit resolution so before/after match (512 uses
+    # the grid-512 sidecar; 1024 uses the canonical 64³ latents).
+    edit_res = int(p25_cfg.get("trellis2_edit_res", 1024))
+    d = Path(ctx.dir) / "p1_encode"
+    suffix = "" if edit_res == 1024 else f"_e{edit_res}"
+    shape_slat = _slat_from_npz(d / f"shape_slat{suffix}.npz")
+    tex_slat = _slat_from_npz(d / f"tex_slat{suffix}.npz")
+    mesh = pipeline.decode_latent(shape_slat, tex_slat, edit_res)[0]
+    env = _get_envmap(p25_cfg, logger)
+    res = int(p25_cfg.get("trellis2_gate_view_res", 512))
+    imgs = _ov.render_sample(mesh, envmap=env, resolution=res, bg=(1, 1, 1))
+    gate_dir.mkdir(parents=True, exist_ok=True)
+    for name, rgb in imgs.items():
+        Image.fromarray(rgb).save(gate_dir / f"before_view_{name}.png")
+    logger.info("[s5] %s rendered %d before-views (decoded latents) → %s",
+                ctx.obj_id, len(imgs), gate_dir.name)
 
 
 # ─────────────────── per-object processing ───────────────────────────
@@ -673,29 +809,61 @@ def run_for_object(
                     error=f"load_object: {e}")
         res.error = str(e); res.n_fail = len(pending); return res
 
-    emit_before = bool(p25_cfg.get("emit_before", True))
+    # emit_glb=False → skip the HEAVY to_glb export (remesh + decimate + 4096²
+    # texture bake + webp).  The edit stage then only decodes the latents and
+    # renders the named gate views from them (PbrMeshRenderer) — fully
+    # latents-level, no GLB asset written.  Turn off for fast eval-only smoke;
+    # turn on when you actually want the editable GLB asset.
+    emit_glb = bool(p25_cfg.get("trellis2_emit_glb", True))
     # After.glb is exported in TRELLIS's canonical frame (Y↔Z swapped, ×0.5,
     # object tipped onto its end).  Reframe it back onto the original full.glb
     # world frame so the dataset/condition/preview all share one frame.
     reframe_on = bool(p25_cfg.get("trellis2_export_partverse_frame", True))
     reframe_npz = ctx.mesh_npz if (reframe_on and ctx.mesh_npz is not None) else None
-    # Masked latent editing (Vinedresser3D-style: preserve outside the part,
-    # re-flow inside) is the default.  Set use_mask=False (legacy key: use_p4)
-    # to fall back to naive full re-generation from the edited 2D image.
-    use_p4 = bool(p25_cfg.get("use_mask", p25_cfg.get("use_p4", True)))
     edits_2d_subdir = p25_cfg.get("edits_2d_subdir", "edits_2d")
     t0 = time.time()
 
     from PIL import Image
 
-    p1_feats = p1_coords3 = None
-    white_model = False
-    if use_p4:
-        p1_feats, p1_coords3 = _load_p1_slat(ctx)
-        from partcraft.pipeline_v3.trellis2_white import read_white_model_flag
-        white_model = read_white_model_flag(ctx)
-        log.info("[s5/P4] %s loaded P1 SLat (%d tokens)  white_model=%s",
-                 ctx.obj_id, int(p1_coords3.shape[0]), white_model)
+    # Edit resolution: 1024 (default) or 512.  S1 always uses the 64³ body;
+    # for 512, S2 additionally needs the grid-512 (32³) sidecar body.
+    edit_res = int(p25_cfg.get("trellis2_edit_res", 1024))
+
+    # Masked latent editing (Vinedresser3D-style: preserve outside the part,
+    # re-flow inside) is the only path — load the P1-encoded original SLat that
+    # the inversion anchors to.
+    p1_feats, p1_coords3 = _load_p1_slat(ctx)          # 64³ — S1
+    if edit_res != 1024:
+        p1_feats_s2, p1_coords_s2 = _load_p1_slat(ctx, res=edit_res)  # 32³ — S2
+    else:
+        p1_feats_s2, p1_coords_s2 = p1_feats, p1_coords3
+    # P1-encoded ORIGINAL tex latent (aligned to p1_coords_s2) for the
+    # restore-style tex posthoc; optional (older trees may lack the sidecar).
+    try:
+        p1_tex_s2, _ = _load_p1_slat(ctx, res=edit_res, which="tex")
+    except FileNotFoundError:
+        p1_tex_s2 = None
+    from partcraft.pipeline_v3.trellis2_white import read_white_model_flag
+    # Phase-1 may flag an object as an untextured white model; the
+    # trellis2_force_white_model config knob forces it for ALL objects
+    # (shape-only experiments: stop after S2 shape, decode a grey 512 mesh,
+    # skip the texture SLat stage).
+    white_model = (read_white_model_flag(ctx)
+                   or bool(p25_cfg.get("trellis2_force_white_model", False)))
+    log.info("[s5/P4] %s loaded P1 SLat (S1 %d tok @64³, S2 %d tok @%d³)  "
+             "edit_res=%d white_model=%s", ctx.obj_id,
+             int(p1_coords3.shape[0]), int(p1_coords_s2.shape[0]),
+             edit_res // 16, edit_res, white_model)
+
+    # gate-E "before": render the ORIGINAL mesh at the named views once per
+    # object (same PbrMeshRenderer + envmap + white bg as the per-edit "after"),
+    # so gate-E sees one consistent render style.
+    render_gate_views = bool(p25_cfg.get("trellis2_render_gate_views", False))
+    if render_gate_views:
+        try:
+            _render_before_named_views(pipeline, ctx, ctx.dir / "gate_views", p25_cfg, log)
+        except Exception as e:
+            log.warning("[s5] %s before-view render failed: %s", ctx.obj_id, e)
 
     for spec in pending:
         try:
@@ -706,54 +874,40 @@ def run_for_object(
 
             pair_dir = ctx.edit_3d_dir(spec.edit_id)
             after_glb = pair_dir / "after.glb"
-            if use_p4:
-                # The original (pre-edit) view drives the RF inversion that
-                # anchors the preserved region; the edited view drives the
-                # forward edit.  flux_2d wrote both as *_input/_edited.png.
-                input_path = (ctx.dir / edits_2d_subdir /
-                              f"{spec.edit_id}_input.png")
-                if not input_path.exists():
-                    raise FileNotFoundError(
-                        f"masked edit needs the original view: {input_path}")
-                orig_img = Image.open(input_path).convert("RGB")
-                mesh_obj, latents = _build_p4_mesh(
-                    pipeline, spec, edited_img, orig_img,
-                    p1_feats, p1_coords3,
-                    ctx.mesh_npz, p25_cfg, log,
-                    white_model=white_model,
-                )
-                if bool(p25_cfg.get("trellis2_save_latents", True)):
-                    try:
-                        _save_edit_latents(latents, pair_dir, log)
-                    except Exception as e:
-                        log.warning("[s5] %s latent save failed: %s",
-                                    spec.edit_id, e)
-                _run_and_export(pipeline, edited_img, after_glb, p25_cfg, log,
-                                mesh_obj=mesh_obj, reframe_mesh_npz=reframe_npz)
-                # gate-E "after" = render the post-edit latents at named views.
-                if bool(p25_cfg.get("trellis2_render_after_views", False)):
-                    try:
-                        _render_after_named_views(mesh_obj, pair_dir, p25_cfg, log)
-                    except Exception as e:
-                        log.warning("[s5] %s after-view render failed: %s",
-                                    spec.edit_id, e)
-            else:
-                _run_and_export(pipeline, edited_img, after_glb, p25_cfg, log,
-                                reframe_mesh_npz=reframe_npz)
-
-            if emit_before and not use_p4:
-                before_img = _load_view_image(spec, obj_record, p25_cfg)
-                if before_img is None:
-                    input_path = ctx.dir / edits_2d_subdir / f"{spec.edit_id}_input.png"
-                    if input_path.exists():
-                        before_img = Image.open(input_path).convert("RGB")
-                if before_img is not None:
-                    before_glb = pair_dir / "before.glb"
-                    _run_and_export(pipeline, before_img, before_glb, p25_cfg, log,
-                                    reframe_mesh_npz=reframe_npz)
-                else:
-                    log.warning("[s5] %s no input image for before.glb (skip)",
-                                spec.edit_id)
+            # The original (pre-edit) view drives the RF inversion that anchors
+            # the preserved region; the edited view drives the forward edit.
+            # flux_2d wrote both as *_input/_edited.png.
+            input_path = (ctx.dir / edits_2d_subdir /
+                          f"{spec.edit_id}_input.png")
+            if not input_path.exists():
+                raise FileNotFoundError(
+                    f"masked edit needs the original view: {input_path}")
+            orig_img = Image.open(input_path).convert("RGB")
+            mesh_obj, latents = _build_p4_mesh(
+                pipeline, spec, edited_img, orig_img,
+                p1_feats, p1_coords3,
+                ctx.mesh_npz, p25_cfg, log,
+                white_model=white_model,
+                p1_feats_s2=p1_feats_s2, p1_coords_s2=p1_coords_s2,
+                p1_tex_s2=p1_tex_s2,
+                edit_res=edit_res,
+            )
+            if bool(p25_cfg.get("trellis2_save_latents", True)):
+                try:
+                    _save_edit_latents(latents, pair_dir, log)
+                except Exception as e:
+                    log.warning("[s5] %s latent save failed: %s",
+                                spec.edit_id, e)
+            if emit_glb:
+                _export_edit_glb(mesh_obj, after_glb, p25_cfg, log,
+                                 reframe_mesh_npz=reframe_npz)
+            # gate-E "after" = render the post-edit latents at named views.
+            if render_gate_views:
+                try:
+                    _render_after_named_views(mesh_obj, pair_dir, p25_cfg, log)
+                except Exception as e:
+                    log.warning("[s5] %s after-view render failed: %s",
+                                spec.edit_id, e)
 
             res.n_ok += 1
             update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s5",
@@ -796,7 +950,7 @@ def run(
     # Reuse the same services_cfg flattener as v1; YAML keys for trellis2
     # live under the same services.image_edit / pipeline.* section unless
     # you split them. Extra v2-specific keys are read with defaults inside
-    # _ensure_pipeline / _run_and_export.
+    # _ensure_pipeline / _export_edit_glb.
     p25_cfg = psvc.trellis_image_edit_flat(cfg)
 
     from partcraft.io.hy3d_loader import HY3DPartDataset
