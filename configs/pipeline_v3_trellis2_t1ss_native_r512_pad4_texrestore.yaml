@@ -1,6 +1,9 @@
 # =====================================================================
-# Pipeline v3 — *** RECOMMENDED / OPTIMAL 3D-edit recipe ***  (512, pad4)
+# Pipeline v3 — *** CANONICAL / PRODUCTION 3D-edit config ***  (512, pad4)
 # =====================================================================
+# This is THE definitive pipeline config.  Every other recipe lives under
+# configs/experiments/ — this one is the one to run for real.
+#
 # S1 = TRELLIS.1's SS flow + DINOv2 cond IN-PROCESS (trellis2_s1_ss_model: t1,
 #      partcraft/pipeline_v3/trellis1_ss.py) — masked edit_grid, pad=4 dilation +
 #      same-frame 64³ restore_preserved.  NO offline bridge.
@@ -11,22 +14,32 @@
 #      decodes to the EXACT original material (mirrors S1 restore_preserved).
 # edit_res=512, NO white-model → fully textured 512 mesh.  GLB OFF by default.
 #
-# Run (single trellis2 env, no offline prep; seed the output tree first):
-#   bash scripts/experiments/seed_masked_e512_variant.sh \
-#        data/Pxform_v2/_exp_t1ss_native_r512_pad2_restore \
-#        data/Pxform_v2/_exp_t1ss_native_r512_pad4_texrestore
-#   SHARD=08 OBJ_IDS_FILE=data/Pxform_v2/_exp_masked_perstep_r512_pad0/seeded_ids.txt FORCE=1 \
-#   STAGES=trellis2_preview,gate_quality MACHINE_ENV=configs/machine/local_trellis2.env PIPELINE_GPUS="0,1" \
-#     bash run_pipeline_v3_shard_trellis2.sh shard08_t1native_texrestore \
+# OUTPUT: data/Pxform_v2/prod/objects/<shard>/<obj_id>/{p1_encode, edits_2d,
+#         gate_views, edits_3d/<edit_id>/, edit_status.json, qc.json}.
+#         Every shard writes under the SAME prod tree (objects/<shard>/…).
+#
+# Run ONE shard end-to-end (all stages: encode→VLM→FLUX→gates→3D edit→Gate-E):
+#   SHARD=08 MACHINE_ENV=configs/machine/local_trellis2.env PIPELINE_GPUS="0,1,2,3,4,5,6,7" \
+#     bash run_pipeline_v3_shard_trellis2.sh prod_shard08 \
 #          configs/pipeline_v3_trellis2_t1ss_native_r512_pad4_texrestore.yaml
-#   (drop ,gate_quality to skip the VLM Gate-E judge and only produce the latents+views)
+#
+# Run ALL 10 shards (00..09) — loop, each writes into data/Pxform_v2/prod:
+#   for S in 00 01 02 03 04 05 06 07 08 09; do
+#     SHARD=$S MACHINE_ENV=configs/machine/local_trellis2.env PIPELINE_GPUS="0,1,2,3,4,5,6,7" \
+#       bash run_pipeline_v3_shard_trellis2.sh prod_shard$S \
+#            configs/pipeline_v3_trellis2_t1ss_native_r512_pad4_texrestore.yaml
+#   done
+#
+#   STAGES=<subset>   limit stages (e.g. STAGES=trellis2_preview,gate_quality to
+#                     only (re)run the 3D edit + Gate-E on an already-seeded tree)
+#   OBJ_IDS_FILE=...  limit to listed object ids   |   FORCE=1  re-run done steps
 # =====================================================================
 
 blender: /mnt/zsn/zsn_workspace/VoxHammer/third_party/blender-4.2.19-linux-x64/blender
 ckpt_root: /mnt/zsn/ckpts/TRELLIS.2-4B
 
 data:
-  output_dir: data/Pxform_v2/_exp_t1ss_native_r512_pad4_texrestore   # T1-SS arm (same recipe, T1 flow)
+  output_dir: data/Pxform_v2/prod   # PRODUCTION tree — all shards land here (objects/<shard>/…)
   mesh_root:   data/partverse/inputs/mesh
   images_root: data/partverse/inputs/images
 

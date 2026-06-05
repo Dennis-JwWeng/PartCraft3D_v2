@@ -55,7 +55,7 @@ def main() -> None:
     from partcraft.pipeline_v3.specs import iter_flux_specs
     from partcraft.render import ovox_views as ov
 
-    cfg = yaml.safe_load(open(ROOT / "configs/pipeline_v3_trellis2_flowedit_free_r1024.yaml"))
+    cfg = yaml.safe_load(open(ROOT / "configs/experiments/pipeline_v3_trellis2_flowedit_free_r1024.yaml"))
     root = resolve_root(cfg)
 
     by_obj: dict[str, list[str]] = {}

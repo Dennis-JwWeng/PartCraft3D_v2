@@ -61,7 +61,7 @@ else
   CUDA_VISIBLE_DEVICES=$GPU SHARD=08 OBJ_IDS_FILE=$IDS FORCE=1 STAGES=trellis2_preview \
     MACHINE_ENV=configs/machine/local_trellis2.env PIPELINE_GPUS="0" \
     bash run_pipeline_v3_shard_trellis2.sh shard08_t2pad${PAD} \
-      configs/pipeline_v3_trellis2_masked_perstep_r512_pad${PAD}_restore.yaml || die "T2 arm"
+      configs/experiments/pipeline_v3_trellis2_masked_perstep_r512_pad${PAD}_restore.yaml || die "T2 arm"
 fi
 
 step "4.5/5 seed T1 output tree from pad2 T1 template (pre-3D symlinks + edit_status)"
@@ -72,6 +72,6 @@ step "5/5 T1 arm preview (TRELLIS.1 SS flow via bridge), GPU ${GPU}"
 CUDA_VISIBLE_DEVICES=$GPU SHARD=08 OBJ_IDS_FILE=$IDS FORCE=1 STAGES=trellis2_preview \
   MACHINE_ENV=configs/machine/local_trellis2.env PIPELINE_GPUS="0" \
   bash run_pipeline_v3_shard_trellis2.sh shard08_t1pad${PAD} \
-    configs/pipeline_v3_trellis2_t1ss_perstep_r512_pad${PAD}_restore.yaml || die "T1 arm"
+    configs/experiments/pipeline_v3_trellis2_t1ss_perstep_r512_pad${PAD}_restore.yaml || die "T1 arm"
 
 step "ALL DONE pad=${PAD}"

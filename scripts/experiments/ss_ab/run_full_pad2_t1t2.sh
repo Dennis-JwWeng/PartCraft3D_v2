@@ -44,13 +44,13 @@ step "4/6 T2 arm preview (TRELLIS.2 SS flow), GPUs 0,1"
 SHARD=08 OBJ_IDS_FILE=$IDS FORCE=1 STAGES=trellis2_preview \
   MACHINE_ENV=configs/machine/local_trellis2.env PIPELINE_GPUS="0,1" \
   bash run_pipeline_v3_shard_trellis2.sh shard08_t2full \
-    configs/pipeline_v3_trellis2_masked_perstep_r512_pad2_restore.yaml || die "T2 arm"
+    configs/experiments/pipeline_v3_trellis2_masked_perstep_r512_pad2_restore.yaml || die "T2 arm"
 
 step "5/6 T1 arm preview (TRELLIS.1 SS flow via bridge), GPUs 0,1"
 SHARD=08 OBJ_IDS_FILE=$IDS FORCE=1 STAGES=trellis2_preview \
   MACHINE_ENV=configs/machine/local_trellis2.env PIPELINE_GPUS="0,1" \
   bash run_pipeline_v3_shard_trellis2.sh shard08_t1full \
-    configs/pipeline_v3_trellis2_t1ss_perstep_r512_pad2_restore.yaml || die "T1 arm"
+    configs/experiments/pipeline_v3_trellis2_t1ss_perstep_r512_pad2_restore.yaml || die "T1 arm"
 
 step "6/6 regen comparison HTML"
 $PYVIZ scripts/viz/ab_t1_vs_t2_ssflow_html.py || die "html"

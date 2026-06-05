@@ -1,6 +1,6 @@
 # Runbook — TRELLIS.1-SS native (in-process) masked 3D edit @512
 
-最后更新:2026-06-04 · 分支 `experiment/flowedit-s1`
+最后更新:2026-06-05 · 分支 `main`(已定稿:此配置=唯一正式 config,输出 `data/Pxform_v2/prod`)
 
 把「TRELLIS.1 SS mask 编辑」做成 trellis2 进程内的正式 S1 阶段(不再走 vinedresser3d 离线桥接)。
 单 conda 环境(`trellis2`)、单代码库(当前目录)、单次模型常驻即可端到端跑完带纹理的 3D 编辑。
@@ -32,29 +32,44 @@
 | **`run_pipeline_v3_shard_trellis2.sh`** | 多物体、多卡并行、可选 VLM/FLUX/gate 的完整分片管线;内部 dispatch `python -m partcraft.pipeline_v3.run_trellis2` | **正式跑批 / 复现实验** |
 | `run_pipeline_minimal.py` | 单物体、CLI 给定 edit、跳过 VLM 与 gate | 单物体快速 debug / 看一条 edit |
 
-### 正式跑最优方案(8 卡里用 0,1 两卡)
+### 配置位置(已定稿)
+
+- **唯一正式配置** = `configs/pipeline_v3_trellis2_t1ss_native_r512_pad4_texrestore.yaml`(顶层)。
+- 其余所有配方都已挪到 `configs/experiments/`,只作对照/复现,不用于正式跑批。
+- **输出根** = `data/Pxform_v2/prod`,每个 shard 落在 `prod/objects/<shard>/<obj_id>/`(见 §产物路径)。
+
+### 正式跑批 —— 单 shard 端到端(全 8 卡)
+
+从头跑完整管线(encode → VLM 出 edit + gate_a → FLUX 2D → gate_c → 3D 编辑 → Gate-E):
 
 ```bash
 cd /mnt/zsn/zsn_workspace/PartCraft3D_v2
 
-# 1) 先 seed 输出树(从已有 native 模板克隆 edits_2d / p1_encode / phase1 / edit_status)
-bash scripts/experiments/seed_masked_e512_variant.sh \
-     data/Pxform_v2/_exp_t1ss_native_r512_pad2_restore \
-     data/Pxform_v2/_exp_t1ss_native_r512_pad4_texrestore
-
-# 2) 跑 3D 编辑阶段(trellis2_preview 只跑 trellis2_3d,前面 2D/gate 已 seed 好)
 SHARD=08 \
-OBJ_IDS_FILE=data/Pxform_v2/_exp_masked_perstep_r512_pad0/seeded_ids.txt \
-FORCE=1 \
-STAGES=trellis2_preview,gate_quality \
 MACHINE_ENV=configs/machine/local_trellis2.env \
-PIPELINE_GPUS="0,1" \
-  bash run_pipeline_v3_shard_trellis2.sh shard08_t1native_texrestore \
+PIPELINE_GPUS="0,1,2,3,4,5,6,7" \
+  bash run_pipeline_v3_shard_trellis2.sh prod_shard08 \
        configs/pipeline_v3_trellis2_t1ss_native_r512_pad4_texrestore.yaml \
-  > data/Pxform_v2/_scratch/t1native_texrestore.log 2>&1 &
+  > data/Pxform_v2/prod/_run_shard08.log 2>&1 &
 ```
 
-- `PIPELINE_GPUS="0,1"` → 脚本把物体在两卡上 round-robin(`--single-gpu --gpu-shard 0/2` 和 `1/2`),真正双卡并行。
+### 正式跑批 —— 全量 10 个 shard(00..09)
+
+每个 shard 一次调用,全部落进同一棵 `data/Pxform_v2/prod` 树:
+
+```bash
+for S in 00 01 02 03 04 05 06 07 08 09; do
+  SHARD=$S MACHINE_ENV=configs/machine/local_trellis2.env PIPELINE_GPUS="0,1,2,3,4,5,6,7" \
+    bash run_pipeline_v3_shard_trellis2.sh prod_shard$S \
+         configs/pipeline_v3_trellis2_t1ss_native_r512_pad4_texrestore.yaml \
+    > data/Pxform_v2/prod/_run_shard$S.log 2>&1
+done
+```
+
+> 实验式快跑(复用 sibling 树、只重跑 3D 编辑)仍可用 `STAGES=trellis2_preview,gate_quality`
+> + `OBJ_IDS_FILE=...` + `FORCE=1` 指向某棵 `_exp_*` 树;见 `data/Pxform_v2/README.md`。
+
+- `PIPELINE_GPUS="0,1,...,7"` → 脚本把该 shard 的物体在这些卡上 round-robin(`--single-gpu --gpu-shard k/N`),真正多卡并行。
 - `STAGES=trellis2_preview,gate_quality`:`trellis2_3d` 跑 3D 编辑并渲染 gate-E before/after 视图,`gate_quality`(Gate E)再起一批 VLM 判每条编辑的视觉质量,写 `gate_e: pass/fail` 进 `edit_status.json`(`stages.gate_e` + `gates.E.vlm`)。只要 latents+视图、不要 VLM 判分就去掉 `,gate_quality`;要从头(encode+VLM+FLUX+gate)则整个去掉 `STAGES`。
   - Gate E 读 `gate_views/before_view_*` 和 `edits_3d/<id>/after_view_*`(都由 `trellis2_preview` 在 `trellis2_render_gate_views: true` 下产出);没有 after 视图的编辑类型(本配方 `qc.edit_types: [modification, scale]` 之外的)会判 `missing_previews=fail`,属正常。
 - `FORCE=1`:无视已完成状态重跑。
@@ -164,15 +179,19 @@ python run_pipeline_minimal.py --shard 08 --obj-id <obj_id> \
 
 ## 5. 产物路径
 
+正式跑批的输出根是 `data/Pxform_v2/prod`,每个 shard 落在 `objects/<shard>/`:
+
 ```
-data/Pxform_v2/_exp_t1ss_native_r512_pad4_texrestore/objects/08/<obj>/
-  edits_2d/<eid>_input.png, <eid>_edited.png     # seed 来的 2D 条件
+data/Pxform_v2/prod/objects/<shard>/<obj>/
+  p1_encode/  (ss.npz, shape_slat.npz, tex_slat.npz, *_slat_e512.npz)   # P1 编码 latent
+  edits_2d/<eid>_input.png, <eid>_edited.png     # FLUX 2D 编辑前/后图
   gate_views/before_view_*.png                    # decode 原始 latent 的 before
   edits_3d/<eid>/
     latents/  (ss.npz, shape_slat.npz, tex_slat.npz)
     after_view_{front,right,back,left,down}.png    # GLB 默认关;要 after.glb 把 emit_glb 改 true
+  edit_status.json, qc.json                        # 各 gate(A/C/E)判定
 ```
-日志:`data/Pxform_v2/_scratch/t1native_texrestore.log`
+每个 shard 的运行日志:`data/Pxform_v2/prod/_run_shard<NN>.log`
 对比可视化:`scripts/viz/ab_tex_perstep_vs_posthoc_html.py` →
 `data/Pxform_v2/_scratch/ab_compare/tex_perstep_vs_posthoc_vs_restore.html`(perstep / 重采样 posthoc / restore 三路)
 

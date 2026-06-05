@@ -19,7 +19,7 @@
 ```bash
 MACHINE_ENV=configs/machine/local_trellis2.env \
   bash run_pipeline_v3_shard_trellis2.sh \
-       shard08 configs/pipeline_v3_trellis2_partverse.yaml
+       shard08 configs/experiments/pipeline_v3_trellis2_partverse.yaml
 ```
 冒烟(2 对象):加 `OBJ_IDS_FILE=<ids.txt> SHARD=08 LIMIT=2`,tag 换 `shard08_smoke`。
 单步续跑:`STAGES=flux_2d,gate_2d` 限定 stage;`FORCE=1` 重跑已完成项(仍尊重 gate 前置)。
@@ -71,7 +71,7 @@ data/Pxform_v2/
 | Blender | 4.2.19 LTS (`.../VoxHammer/third_party/blender-4.2.19-linux-x64/blender`) |
 | GPU | L20 × 8 |
 
-机器相关变量在 `configs/machine/local_trellis2.env`;run 相关参数在 `configs/pipeline_v3_trellis2_partverse.yaml`。
+机器相关变量在 `configs/machine/local_trellis2.env`;run 相关参数在 `configs/experiments/pipeline_v3_trellis2_partverse.yaml`。
 
 > **环境坑(已在仓库内自动修补)**:① transformers 5.9 把 DINOv3 层挪到 `model.model.layer`,
 > 破坏 `pipeline.get_cond` → `trellis2_compat.patch_dinov3_extractor()`(`_ensure_pipeline` 调用)。

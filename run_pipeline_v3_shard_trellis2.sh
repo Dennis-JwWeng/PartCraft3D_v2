@@ -6,15 +6,17 @@
 #   * defaults MACHINE_ENV to configs/machine/local_trellis2.env
 #     (trellis2 conda env + TRELLIS.2 ckpts + Blender 4.2.19)
 #
-# Usage (full shard, 8-GPU concurrent):
-#   MACHINE_ENV=configs/machine/local_trellis2.env \
+# Usage (full shard, 8-GPU concurrent) — canonical/production config:
+#   SHARD=08 MACHINE_ENV=configs/machine/local_trellis2.env PIPELINE_GPUS="0,1,2,3,4,5,6,7" \
 #     bash run_pipeline_v3_shard_trellis2.sh \
-#          shard08 configs/pipeline_v3_trellis2_partverse.yaml
+#          prod_shard08 configs/pipeline_v3_trellis2_t1ss_native_r512_pad4_texrestore.yaml
 #
 # Quick smoke (a couple of objects):
 #   OBJ_IDS_FILE=<ids.txt> SHARD=08 LIMIT=2 \
 #     bash run_pipeline_v3_shard_trellis2.sh \
-#          shard08_smoke configs/pipeline_v3_trellis2_partverse.yaml
+#          prod_shard08_smoke configs/pipeline_v3_trellis2_t1ss_native_r512_pad4_texrestore.yaml
+#
+# (Other recipes live under configs/experiments/ and are for A/B comparison only.)
 #
 # Originally mirrored scripts/tools/run_pipeline_v2_shard.sh but targets pipeline_v3.
 # Scheduling (GPUs, ports, server pools, parallel batches, sub-chains) is
