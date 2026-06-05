@@ -127,11 +127,11 @@ python run_pipeline_minimal.py --shard 08 --obj-id <obj_id> \
 > 其它纹理模式(对照):`perstep` = 每步锚到重采样参考(保留区会随编辑图全局条件**漂色**);
 > `posthoc`(无 before-tex 时) = 贴回重采样的 `tex0`(原图条件,挡全局漂但仍是重画);`free` = 完全不 mask。
 
-### 对照配置
+### 对照配置(都在 `configs/experiments/` 下,只作 A/B)
 
-- `..._pad4_full.yaml`：tex 用 perstep(漂色基线),`emit_glb: true`。
-- `..._pad4_texposthoc.yaml`：tex 用 posthoc 但贴重采样 `tex0`(非编码真值)。
-- `..._pad2_restore.yaml`：`force_white_model: true` 白模 + `s1_pad: 2`,做 S1 几何 parity(vs 桥接 IoU≈0.96)。
+- `configs/experiments/..._t1ss_native_r512_pad4_full.yaml`:tex 用 perstep(漂色基线),`emit_glb: true`。
+- `configs/experiments/..._t1ss_native_r512_pad4_texposthoc.yaml`:tex 用 posthoc 但贴重采样 `tex0`(非编码真值)。
+- `configs/experiments/..._t1ss_native_r512_pad2_restore.yaml`:`force_white_model: true` 白模 + `s1_pad: 2`,做 S1 几何 parity(vs 桥接 IoU≈0.96)。
 
 ---
 
