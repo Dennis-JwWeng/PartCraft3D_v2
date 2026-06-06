@@ -316,7 +316,7 @@ async def _call_vlm_for_one(client, ctx: ObjectContext, user_msg: str,
 
             try:
                 raw = await call_vlm_image_async(
-                    client, ov_png, SYSTEM_PROMPT_A, eff_msg, model, max_tokens=12288,
+                    client, ov_png, SYSTEM_PROMPT_A, eff_msg, model, max_tokens=4096,
                 )
             except Exception as e:
                 last_error = str(e)
@@ -485,10 +485,23 @@ async def gen_edits_streaming(
 
     loop = asyncio.get_running_loop()
     pool = ProcessPoolExecutor(max_workers=n_prerender_workers)
-    queue: asyncio.Queue = asyncio.Queue(maxsize=2 * len(vlm_urls))
+
+    # Per-GPU in-flight concurrency: how many objects' (phase1 + inline gate_a)
+    # chains run at once against EACH sglang server.  1 = legacy (no batching,
+    # GPU at 96% util but single-stream throughput).  sglang batches concurrent
+    # requests into one forward pass → ~Nx throughput.  KV pool is statically
+    # pre-allocated (--mem-fraction-static), so overflow queues, never OOMs.
+    # Override with S1_PER_GPU_CONCURRENCY env.
+    try:
+        PER_GPU = max(1, int(os.environ.get("S1_PER_GPU_CONCURRENCY", "4")))
+    except ValueError:
+        PER_GPU = 4
+    queue: asyncio.Queue = asyncio.Queue(maxsize=2 * len(vlm_urls) * PER_GPU)
 
     clients = [AsyncOpenAI(base_url=u, api_key="EMPTY") for u in vlm_urls]
-    sems = [asyncio.Semaphore(1) for _ in clients]
+    sems = [asyncio.Semaphore(PER_GPU) for _ in clients]
+    log.info("s1 streaming (image): per-GPU concurrency=%d  → peak in-flight=%d (servers=%d × %d)",
+             PER_GPU, len(clients) * PER_GPU, len(clients), PER_GPU)
 
     n_done = 0
     n_total = len(todo)
@@ -519,7 +532,7 @@ async def gen_edits_streaming(
                 await build_one(c)
 
         await asyncio.gather(*[_wrap(c) for c in todo])
-        for _ in range(len(clients)):
+        for _ in range(len(clients) * PER_GPU):
             await queue.put(None)
 
     async def consumer(idx: int):
@@ -546,7 +559,10 @@ async def gen_edits_streaming(
                     log.warning("post_object_fn %s: %s", ctx.obj_id[:12], _hook_exc)
 
     try:
-        await asyncio.gather(producer(), *[consumer(i) for i in range(len(clients))])
+        consumers = [consumer(i)
+                     for i in range(len(clients))
+                     for _ in range(PER_GPU)]
+        await asyncio.gather(producer(), *consumers)
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 

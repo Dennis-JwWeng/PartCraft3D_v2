@@ -128,76 +128,83 @@ def masked_shape_slat(
 
     clean = _sparse_on(coords0, ((p1_feats.to(dev) - mean) / std).contiguous())
 
-    if pipeline.low_vram:
-        flow.to(dev)
-    inv = sampler.invert_clean(
-        flow, clean,
-        cond=cond_orig["cond"], neg_cond=cond_orig["neg_cond"],
-        guidance_strength=1.0, guidance_interval=gi, guidance_rescale=grescale,
-        steps=steps, rescale_t=rescale_t, verbose=False, tqdm_desc="S2 shape inv",
-    )
-
     preserved, src_idx = build_coord_bridge(coords0, coords_new, edit_grid64, grid=grid)
     preserved, src_idx = preserved.to(dev), src_idx.to(dev)
     feats_init = torch.randn(coords_new.shape[0], flow.in_channels, device=dev)
-    feats_init[preserved] = inv[1.0].feats[src_idx]
-    seeded = preserved.clone()
-    if warmstart or nn_init:
-        warm, warm_src = incore_edit_bridge(coords0, coords_new, edit_grid64, grid=grid)
-        warm, warm_src = warm.to(dev), warm_src.to(dev)
-        feats_init[warm] = inv[1.0].feats[warm_src]
-        seeded = seeded | warm
-        logger.info("[s5/S2] shape warm-start: %d edit tokens seeded from "
-                    "inverted original (%d newly-grown %s)",
-                    int(warm.sum()), int((~seeded).sum()),
-                    "→ nearest-neighbor init" if nn_init else "stay noise")
-    if nn_init:
-        unseeded = ~seeded
-        if bool(unseeded.any()) and bool(seeded.any()):
-            cN = coords_new.to(dev).float()
-            if cN.shape[1] == 4:
-                cN = cN[:, 1:]
-            src_pts = cN[seeded]            # [S,3] already-seeded coords
-            qry_pts = cN[unseeded]          # [U,3] newly-grown coords
-            nn = torch.cdist(qry_pts, src_pts).argmin(dim=1)  # [U]
-            feats_init[unseeded] = feats_init[seeded][nn]
-            logger.info("[s5/S2] shape NN-init: %d newly-grown tokens seeded "
-                        "from nearest of %d seeded",
-                        int(unseeded.sum()), int(seeded.sum()))
+
     if anchor_mode in ("posthoc", "free"):
-        # free (vanilla-quality) generation of the whole field — start every
-        # token from pure noise so the edit region is sampled exactly like a
-        # fresh pipeline.run (no inverted-original neighbours to fight).
-        # "posthoc" pastes the body latent back at the end (exact preservation);
-        # "free" keeps the whole field as generated — the body is preserved only
-        # STRUCTURALLY, by reusing the original occupancy coords from masked S1,
-        # so the surface is fully coherent (no boundary seam) at the cost of the
-        # body no longer being latent-identical to the original.
-        feats_init = torch.randn(coords_new.shape[0], flow.in_channels, device=dev)
+        # free (vanilla-quality) generation of the whole field — every token
+        # starts from pure noise so the edit region is sampled exactly like a
+        # fresh pipeline.run (no inverted-original neighbours to fight → the
+        # generated part decodes SOLID, not a holey see-through shell).
+        # "posthoc" hard-pastes the BEFORE-encoded body latent back at the end
+        # (exact preservation — the shape twin of tex posthoc-restore); "free"
+        # keeps the whole generated field (body preserved only STRUCTURALLY via
+        # the reused occupancy coords).  Neither anchors to the inverted
+        # original, so the costly invert_clean pass is SKIPPED entirely.
+        if pipeline.low_vram:
+            flow.to(dev)
         cb = None
-    elif anchor_mode == "release_late":
-        cb = make_bridged_anchor_callback(
-            inv, preserved, src_idx, schedule="early", cutoff_t=float(anchor_cutoff))
-    elif anchor_mode == "contact_soft":
-        # v1-faithful: preserved tokens NEAR the contact boundary are allowed to
-        # blend with the generation (heals the seam); tokens far from contact are
-        # fully anchored to the inverted original.  Per-token weight from the
-        # contact-distance soft mask (mirrors interweave get_s2_soft_mask).
-        from .trellis2_contact_mask import get_s2_soft_mask
-        c3 = coords_new.to(dev)
-        c3 = c3[:, 1:] if c3.shape[1] == 4 else c3
-        sigma = float(contact_sigma) if contact_sigma is not None else 5.0
-        soft_w = get_s2_soft_mask(
-            c3[preserved], edit_grid64, sigma=sigma, contact_mask=contact_mask
-        ).to(dev)
-        cb = make_bridged_anchor_callback(
-            inv, preserved, src_idx, soft_w=soft_w)
-        logger.info("[s5/S2] shape contact-soft: %d preserved tokens, "
-                    "blend-weight range [%.2f, %.2f] (sigma=%.2f)",
-                    int(preserved.sum()), float(soft_w.min()) if soft_w.numel() else 0.0,
-                    float(soft_w.max()) if soft_w.numel() else 0.0, sigma)
-    else:  # "perstep"
-        cb = make_bridged_anchor_callback(inv, preserved, src_idx)
+        logger.info("[s5/S2] shape anchor_mode=%s — free gen, NO inversion "
+                    "(invert_clean skipped)", anchor_mode)
+    else:
+        # perstep / release_late / contact_soft anchor preserved tokens to the
+        # inverted original → need the inversion trajectory.
+        if pipeline.low_vram:
+            flow.to(dev)
+        inv = sampler.invert_clean(
+            flow, clean,
+            cond=cond_orig["cond"], neg_cond=cond_orig["neg_cond"],
+            guidance_strength=1.0, guidance_interval=gi, guidance_rescale=grescale,
+            steps=steps, rescale_t=rescale_t, verbose=False, tqdm_desc="S2 shape inv",
+        )
+        feats_init[preserved] = inv[1.0].feats[src_idx]
+        seeded = preserved.clone()
+        if warmstart or nn_init:
+            warm, warm_src = incore_edit_bridge(coords0, coords_new, edit_grid64, grid=grid)
+            warm, warm_src = warm.to(dev), warm_src.to(dev)
+            feats_init[warm] = inv[1.0].feats[warm_src]
+            seeded = seeded | warm
+            logger.info("[s5/S2] shape warm-start: %d edit tokens seeded from "
+                        "inverted original (%d newly-grown %s)",
+                        int(warm.sum()), int((~seeded).sum()),
+                        "→ nearest-neighbor init" if nn_init else "stay noise")
+        if nn_init:
+            unseeded = ~seeded
+            if bool(unseeded.any()) and bool(seeded.any()):
+                cN = coords_new.to(dev).float()
+                if cN.shape[1] == 4:
+                    cN = cN[:, 1:]
+                src_pts = cN[seeded]            # [S,3] already-seeded coords
+                qry_pts = cN[unseeded]          # [U,3] newly-grown coords
+                nn = torch.cdist(qry_pts, src_pts).argmin(dim=1)  # [U]
+                feats_init[unseeded] = feats_init[seeded][nn]
+                logger.info("[s5/S2] shape NN-init: %d newly-grown tokens seeded "
+                            "from nearest of %d seeded",
+                            int(unseeded.sum()), int(seeded.sum()))
+        if anchor_mode == "release_late":
+            cb = make_bridged_anchor_callback(
+                inv, preserved, src_idx, schedule="early", cutoff_t=float(anchor_cutoff))
+        elif anchor_mode == "contact_soft":
+            # v1-faithful: preserved tokens NEAR the contact boundary are allowed to
+            # blend with the generation (heals the seam); tokens far from contact are
+            # fully anchored to the inverted original.  Per-token weight from the
+            # contact-distance soft mask (mirrors interweave get_s2_soft_mask).
+            from .trellis2_contact_mask import get_s2_soft_mask
+            c3 = coords_new.to(dev)
+            c3 = c3[:, 1:] if c3.shape[1] == 4 else c3
+            sigma = float(contact_sigma) if contact_sigma is not None else 5.0
+            soft_w = get_s2_soft_mask(
+                c3[preserved], edit_grid64, sigma=sigma, contact_mask=contact_mask
+            ).to(dev)
+            cb = make_bridged_anchor_callback(
+                inv, preserved, src_idx, soft_w=soft_w)
+            logger.info("[s5/S2] shape contact-soft: %d preserved tokens, "
+                        "blend-weight range [%.2f, %.2f] (sigma=%.2f)",
+                        int(preserved.sum()), float(soft_w.min()) if soft_w.numel() else 0.0,
+                        float(soft_w.max()) if soft_w.numel() else 0.0, sigma)
+        else:  # "perstep"
+            cb = make_bridged_anchor_callback(inv, preserved, src_idx)
     x_init = _sparse_on(coords_new, feats_init)
     logger.info("[s5/S2] shape anchor_mode=%s%s", anchor_mode,
                 f" (cutoff_t={anchor_cutoff})" if anchor_mode == "release_late" else "")

@@ -31,17 +31,17 @@ import torch
 VIEW_RADIUS = 2.0
 VIEW_FOV_DEG = 40.0
 
-# name → (yaw_deg, pitch_deg).  These are the EXACT angles of the original 5
-# overview viewpoints (sphere_hammersley views 100/90/89/91/8), just renamed —
-# so renders are pixel-identical to the validated overview, with no
-# index→frame mapping.  front/right/back/left ring the object ~90° apart at a
-# slight overhead tilt; ``down`` is the low front-upward view.
+# name → (yaw_deg, pitch_deg).  up = +Z, yaw 0 = +X side, pitch > 0 = above
+# (looking down).  front/right/back/left are AXIS-ALIGNED (0/90/180/270) so each
+# directly faces one side of the object (orthographic-like front view, NOT the
+# old ~45°-offset corner/3-quarter angles), at a slight overhead tilt (~22°).
+# ``down`` keeps the original low front-upward viewpoint.
 NAMED_VIEWS: dict[str, tuple[float, float]] = {
-    "front": (53.4375,  19.4712),   # was view 100
-    "right": (126.5625, 11.5370),   # was view 90
-    "back":  (216.5625, 10.7583),   # was view 89
-    "left":  (306.5625, 12.3178),   # was view 91
-    "down":  (22.5000, -63.2951),   # was view 8
+    "front": (0.0,    22.0),
+    "right": (90.0,   22.0),
+    "back":  (180.0,  22.0),
+    "left":  (270.0,  22.0),
+    "down":  (22.5000, -63.2951),   # kept (was view 8)
 }
 # overview column order (column k = VIEW_ORDER[k]); gate-A's 0..4 column logic
 # is unchanged — only the column→camera mapping moved here.

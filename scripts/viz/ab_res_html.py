@@ -47,6 +47,24 @@ RECIPES = {
             "整场<b>自由生成</b>（vanilla 质量，无逐步锚定）后，结尾把保留 body token <b>硬粘回原 clean latent</b> → "
             "实心编辑区 + 逐位精确 body（代价：边界可能 1-voxel seam）。tex 走 per-step 锚定 masked 路径。"),
     ),
+    "t1ss": dict(
+        a="data/Pxform_v2/_exp_t1ss_native_r1024_pad4_texrestore/objects/08",
+        b="data/Pxform_v2/_exp_t1ss_native_r512_pad4_texrestore/objects/08",
+        title="TRELLIS.2 t1ss-native masked-edit (pad4 · texrestore) · 1024 vs 512 edit-resolution",
+        s1=(
+            "<b>S1 (sparse structure / occupancy)</b> — <code>trellis2_s1_mode: masked</code> + "
+            "<code>trellis2_s1_ss_model: t1</code>（进程内 NATIVE TRELLIS.1 SS flow + DINOv2 条件，非桥接）。"
+            "反演原 SS latent 后按 16³ keep-mask 在编辑区重绘 occupancy；<code>trellis2_s1_contact_soft: true</code> "
+            "contact-aware 软 mask；<code>trellis2_ss_align_t1: true</code> 用 T1 温和 SS 调度（抗大件塌陷）；"
+            "<code>trellis2_s1_pad: 4</code> 把 64³ edit grid 切比雪夫膨胀 4；"
+            "<code>trellis2_s2_restore_preserved: true</code> 同帧 64³ 把 mask 外被丢的源 body 体素补回。"
+            "<b>SS VAE 固定 64³ occupancy ↔ 16³ latent，1024 与 512 完全相同。</b>"),
+        s2=(
+            "<b>S2 (shape + texture SLat)</b> — SHAPE: <code>trellis2_s2_anchor_mode: perstep</code>（masked 逐步锚定，"
+            "实心编辑部件）。TEXTURE: <code>trellis2_s2_tex_anchor_mode: posthoc</code> = <b>posthoc-restore</b>："
+            "编辑图下自由生成整张纹理 → 终点把 <b>P1 编码的原始 tex latent</b> 通过 shape 桥接 src_idx <b>硬贴回</b>"
+            "保留 token → 保留区 decode 出逐像素原始材质，只有编辑区重画。"),
+    ),
     "flowedit": dict(
         a="data/Pxform_v2/_exp_flowedit_free_r1024/objects/08",
         b="data/Pxform_v2/_exp_flowedit_free_r512/objects/08",

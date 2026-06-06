@@ -427,6 +427,7 @@ def render_overview_from_ovox(
     target_ids: Iterable[int] | None = None,
     bg: tuple[float, float, float] = (1.0, 1.0, 1.0),
     device: str = "cuda",
+    skip_rgb: bool = False,
 ):
     """Render the overview rows from the o-voxel at the **named views**.
 
@@ -446,11 +447,20 @@ def render_overview_from_ovox(
 
     views = list(view_names or _ov.VIEW_ORDER)
 
-    # top row — coloured full mesh; reuse its normalization M for the parts.
-    fc, fattr, M = mesh_to_colored_ovox(
-        mesh_npz, grid_size=color_grid, canonical=canonical, return_M=True)
-    rgb_d = _ov.render_ovoxel(fc, fattr["base_color"], color_grid, views,
-                              resolution=resolution, ssaa=ssaa, bg=bg, device=device)
+    if skip_rgb:
+        # Caller supplies the (PBR) top row separately → skip the expensive
+        # full-mesh colour voxelisation + o-voxel RGB render; only compute the
+        # normalisation M (lightweight) needed for the part-occupancy seg row.
+        scene = load_full_scene(mesh_npz)
+        _, M = _normalized_groups(scene, canonical=canonical)
+        rgb = None
+    else:
+        # top row — coloured full mesh; reuse its normalization M for the parts.
+        fc, fattr, M = mesh_to_colored_ovox(
+            mesh_npz, grid_size=color_grid, canonical=canonical, return_M=True)
+        rgb_d = _ov.render_ovoxel(fc, fattr["base_color"], color_grid, views,
+                                  resolution=resolution, ssaa=ssaa, bg=bg, device=device)
+        rgb = [rgb_d[v] for v in views]
 
     # bottom row — per-part occupancy in the SAME frame, palette-coloured.
     part_coords = part_occupancy_coords(mesh_npz, M, grid_size=part_grid)
@@ -458,7 +468,6 @@ def render_overview_from_ovox(
     hl_d = _ov.render_ovoxel(pc, pcol, part_grid, views,
                              resolution=resolution, ssaa=ssaa, bg=bg, device=device)
 
-    rgb = [rgb_d[v] for v in views]
     highlight = [hl_d[v] for v in views]
     cam = _ov.camera_transforms(views)
     return {"rgb": rgb, "highlight": highlight, "cam": cam,

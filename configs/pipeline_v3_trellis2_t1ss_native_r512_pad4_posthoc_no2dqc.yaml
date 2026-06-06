@@ -1,0 +1,182 @@
+# =====================================================================
+# Pipeline v3 — POSTHOC (shape+tex), NO 2D QC  (512, pad4)  *** PARALLEL to canonical ***
+# =====================================================================
+# Sibling of pipeline_v3_trellis2_t1ss_native_r512_pad4_texrestore.yaml (the
+# canonical config).  Two deliberate differences from canonical:
+#
+#   1. S2 SHAPE uses POSTHOC-RESTORE (trellis2_s2_anchor_mode: posthoc) instead
+#      of perstep — free generation under the edited image (edited part decodes
+#      SOLID, not a holey see-through shell), then HARD-PASTE the P1-encoded
+#      ORIGINAL body shape latent (shape_slat_e512.npz) onto preserved tokens
+#      (exact body, the shape twin of the tex restore).  This SKIPS the shape
+#      flow inversion (invert_clean) → ~1.22x/edit faster, edited part more solid.
+#   2. NO 2D QC: the gate_2d (Gate C) stage is removed.  trellis2_3d then gates
+#      on gate_a (text-align) only — every FLUX 2D edit reaches the 3D edit.
+#
+# Both S2 stages now do ZERO flow inversion:
+#   * SHAPE   posthoc → invert_clean skipped (partcraft/pipeline_v3/trellis2_edit_stages.py).
+#   * TEXTURE posthoc-RESTORE (trellis2_s2_tex_anchor_mode: posthoc + restore_preserved)
+#     → free gen + hard-paste tex_slat_e512.npz; already NO inversion (never re-samples a reference).
+#
+# S1 = TRELLIS.1's SS flow + DINOv2 cond IN-PROCESS (trellis2_s1_ss_model: t1) —
+#      masked edit_grid, pad=4 dilation + same-frame 64³ restore_preserved.
+# edit_res=512, NO white-model → fully textured 512 mesh.  GLB OFF by default.
+#
+# OUTPUT: data/Pxform_v2/prod_posthoc_no2dqc/objects/<shard>/<obj_id>/{...}.
+#
+# Run ONE shard end-to-end (encode→VLM gen+gate_a→FLUX→3D edit→Gate-E; NO gate_2d):
+#   SHARD=08 MACHINE_ENV=configs/machine/local_trellis2.env PIPELINE_GPUS="0,1,2,3,4,5,6,7" \
+#     bash run_pipeline_v3_shard_trellis2.sh posthoc_shard08 \
+#          configs/pipeline_v3_trellis2_t1ss_native_r512_pad4_posthoc_no2dqc.yaml
+#
+#   STAGES=<subset>   limit stages (e.g. STAGES=trellis2_preview,gate_quality)
+#   OBJ_IDS_FILE=...  limit to listed object ids   |   FORCE=1  re-run done steps
+# =====================================================================
+
+blender: /mnt/zsn/zsn_workspace/VoxHammer/third_party/blender-4.2.19-linux-x64/blender
+ckpt_root: /mnt/zsn/ckpts/TRELLIS.2-4B
+
+data:
+  output_dir: data/Pxform_v2/prod_posthoc_no2dqc   # parallel prod tree (shape+tex posthoc, no gate_2d)
+  mesh_root:   data/partverse/inputs/mesh
+  images_root: data/partverse/inputs/images
+
+pipeline:
+  gpus: [0, 1, 2, 3, 4, 5, 6, 7]   # all 8 GPUs → 8-way parallel 3D edit
+
+  vlm_port_base: 8200
+  vlm_port_stride: 1
+  flux_port_base: 8020
+  flux_port_stride: 1
+
+  prerender_workers: 6
+  s6p_del_workers: 6
+
+  stages:
+  - name: trellis2_encode
+    desc: >
+      TRELLIS.2 P1 — encode the ORIGINAL mesh.  trellis2_edit_res=512 ALSO writes
+      the grid-512 sidecar (shape/tex_slat_e512.npz, 32³) for the S2 body anchor.
+    servers: none
+    use_gpus: true
+    steps:
+    - trellis2_encode
+
+  - name: text_gen_gate_a
+    desc: VLM edit generation (Mode A overview) + text-align gate.
+    servers: vlm
+    steps:
+    - gen_edits
+    - gate_text_align
+
+  - name: flux_2d
+    desc: FLUX 2D image editing.
+    servers: flux
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 0
+    steps:
+    - flux_2d
+
+  # gate_2d (Gate C) REMOVED — no 2D QC.  build_prereq_map() sees no gate_2d in
+  # the active steps → gate_c_active=False → trellis2_3d (s5) falls back to the
+  # gate_a prerequisite, so every FLUX 2D edit proceeds to the 3D edit.
+
+  - name: trellis2_preview
+    desc: >
+      TRELLIS.2 masked latent editing at 512 → edits_3d/<edit_id> latents +
+      gate-E before/after named views.
+    servers: none
+    use_gpus: true
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 1
+    steps:
+    - trellis2_3d
+
+  - name: gate_quality
+    desc: >
+      Gate E — VLM visual-quality judge.  Reads the before/after named views
+      produced by trellis2_preview (gate_views/before_view_*,
+      edits_3d/<id>/after_view_*, both PbrMeshRenderer white bg), builds the
+      2x5 before/after collage and scores each edit; writes gate_e pass/fail to
+      edit_status.json / qc.json.  Own VLM batch after the 3D-edit chain.
+    servers: vlm
+    steps:
+    - gate_quality
+
+services:
+  vlm:
+    model: /mnt/zsn/ckpts/Qwen3.6-27B
+
+  image_edit:
+    enabled: true
+    image_edit_backend: local_diffusers
+    workers_per_server: 2
+
+    trellis2_codebase: /mnt/zsn/3dobject/TRELLIS.2
+    trellis2_ckpt:     /mnt/zsn/ckpts/TRELLIS.2-4B
+
+    use_mask: true
+
+    # 512 edit resolution.  S1 = masked + contact-soft + TRELLIS.1 SS schedule.
+    # S2 SHAPE + TEXTURE both POSTHOC-RESTORE → free gen (solid edited part) +
+    # hard-paste the P1-encoded ORIGINAL latents on preserved tokens; ZERO flow
+    # inversion in S2 (both invert_clean passes skipped) → faster + solid part.
+    trellis2_edit_res: 512
+    trellis2_canonical_frame: true
+    trellis2_s1_mode: masked
+    trellis2_s1_contact_soft: true
+    trellis2_ss_align_t1: true
+    trellis2_s1_ss_model: t1                 # NATIVE in-process TRELLIS.1 SS flow + DINOv2 cond (no bridge)
+    trellis2_s2_anchor_mode: posthoc        # SHAPE: posthoc-RESTORE — free gen (SOLID part) + hard-paste
+                                            #   P1-encoded original body latent (shape_slat_e512.npz) on preserved
+                                            #   tokens; SKIPS shape invert_clean (the shape twin of tex restore)
+    trellis2_s2_tex_anchor_mode: posthoc    # TEXTURE: posthoc-RESTORE — free gen + hard-paste the P1-ENCODED
+                                            #   original tex latent (tex_slat_e512.npz) onto preserved tokens
+                                            #   (auto-engaged because the encoded before-tex sidecar exists);
+                                            #   already does NO flow inversion → preserved region = EXACT material
+    # ── 512 + pad4 + restore + FULL texture (no white-model) ──
+    trellis2_s1_pad: 4                      # Chebyshev box-dilate the 64³ edit grid by 4
+    trellis2_s2_restore_preserved: true     # re-insert source body voxels S1 dropped outside the mask
+    # force_white_model OFF → S2 texture (masked_tex_slat, posthoc-restore) runs → textured 512 mesh decode
+
+    trellis2_seed: 1                        # masked-edit sampler seed
+    trellis2_decimation_target: 1000000     # only used when trellis2_emit_glb: true
+    trellis2_texture_size: 4096             # only used when trellis2_emit_glb: true
+    emit_before: true
+
+    trellis2_emit_glb: false   # GLB not needed — skip the heavy 4096² texture-bake-to-GLB; keep latents + after-views
+
+    trellis2_render_gate_views: true
+    trellis2_gate_view_res: 512
+    # Render the 5 named source views (gate_views/before_view_*.png) AT ENCODE
+    # time — GPU/pipeline already hot, single-threaded per object with try/except.
+    # flux_2d then just LOADS these PNGs (edit_2d.py process_one prefers the saved
+    # before_view) instead of doing a concurrent on-the-fly o-voxel render, which
+    # segfaulted (non-thread-safe GL + poison meshes). Render-free flux_2d = no
+    # crash, no GPU during flux_2d, faster, and PBR-consistent with gate-E.
+    trellis2_encode_render_overview: true
+
+    trellis_workers_per_gpu: 1
+
+qc:
+  edit_types: [modification, scale]
+
+  thresholds_by_type:
+    deletion:
+      min_visual_quality: 3
+    modification:
+      min_visual_quality: 3
+      require_preserve_other: true
+    scale:
+      min_visual_quality: 3
+      require_preserve_other: true
+    material:
+      min_visual_quality: 3
+    color:
+      min_visual_quality: 3
+    global:
+      min_visual_quality: 3
+    addition:
+      min_visual_quality: 3

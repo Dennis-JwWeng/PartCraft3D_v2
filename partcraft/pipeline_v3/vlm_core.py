@@ -368,6 +368,7 @@ def render_overview_png(
     blender: "str | None" = None,
     *,
     save_viewpoints: "Path | None" = None,
+    rgb_override: "list | None" = None,
 ) -> bytes:
     """Render the 5×2 overview PNG from the **o-voxel** (no Blender, no input images).
 
@@ -384,10 +385,17 @@ def render_overview_png(
     import json as _json
     from partcraft.pipeline_v3 import trellis2_ovox_render as _ovr
 
-    res = _ovr.render_overview_from_ovox(mesh_npz)
+    # When the caller supplies a PBR RGB top row (rgb_override, e.g. the reused
+    # gate_views), skip the o-voxel RGB render entirely — only the robust o-voxel
+    # SEG row is rendered (the raw-mesh palette raster is the part that crashes CUDA).
+    res = _ovr.render_overview_from_ovox(mesh_npz, skip_rgb=(rgb_override is not None))
     # o-voxel renders are RGB; overview contract is BGR (cv2) so the bottom-row
     # palette lands in _PALETTE_BGR for the gate/pixel-count nearest-colour match.
-    top = [cv2.cvtColor(im, cv2.COLOR_RGB2BGR) for im in res["rgb"]]
+    if rgb_override is not None:
+        h, w = res["highlight"][0].shape[:2]
+        top = [cv2.cvtColor(cv2.resize(im, (w, h)), cv2.COLOR_RGB2BGR) for im in rgb_override]
+    else:
+        top = [cv2.cvtColor(im, cv2.COLOR_RGB2BGR) for im in res["rgb"]]
     bot = [cv2.cvtColor(im, cv2.COLOR_RGB2BGR) for im in res["highlight"]]
     final = stitch_two_rows(top, bot)
     if save_viewpoints is not None:
@@ -642,6 +650,8 @@ __all__ = [
     "run_gate_text_align",
     # ── Quality judge prompts ─────────────────────────────────────────
     "JUDGE_SYSTEM_PROMPT",
+    "JUDGE_SYSTEM_PROMPT_V2",
+    "JUDGE_SYSTEM_PROMPT_V3",
     "build_quality_judge_prompt",
     "parse_quality_judge_response",
     "extract_quality_judge_json",
@@ -1691,6 +1701,211 @@ def _passes_quality_thresholds(judge_json: dict, edit_type: str, thresholds: dic
     return True
 
 
+# v2 defaults: STRICT on mesh geometry, LENIENT (but thresholded) on execution.
+# Overridable per type via cfg["qc"]["thresholds_by_type"], same as _QE_DEFS.
+_QE_DEFS_V2 = {
+    "deletion":     {"min_mesh_quality": 4, "min_edit_strength": 2, "min_visual_quality": 2, "require_preserve_other": True},
+    "modification": {"min_mesh_quality": 4, "min_edit_strength": 2, "min_visual_quality": 2, "require_preserve_other": True},
+    "scale":        {"min_mesh_quality": 4, "min_edit_strength": 2, "min_visual_quality": 2, "require_preserve_other": True},
+    "material":     {"min_mesh_quality": 4, "min_edit_strength": 2, "min_visual_quality": 2, "require_preserve_other": True},
+    "color":        {"min_mesh_quality": 4, "min_edit_strength": 2, "min_visual_quality": 2, "require_preserve_other": True},
+    "global":       {"min_mesh_quality": 4, "min_edit_strength": 2, "min_visual_quality": 2, "require_preserve_other": True},
+    "addition":     {"min_mesh_quality": 4, "min_edit_strength": 2, "min_visual_quality": 2, "require_preserve_other": True},
+}
+
+
+def _passes_quality_thresholds_v2(judge_json: dict, edit_type: str, thresholds: dict) -> bool:
+    """v2 pass logic — mesh integrity is a HARD gate; edit execution is graded
+    and thresholded (lenient).  See ``JUDGE_SYSTEM_PROMPT_V2`` / ``_QE_DEFS_V2``.
+
+    Gate order: mesh_quality >= min_mesh_quality (strict, default 4)
+                AND edit_strength >= min_edit_strength (lenient, default 2)
+                AND visual_quality >= min_visual_quality (soft floor, default 2)
+                AND correct_region
+                AND (require_preserve_other -> preserve_other).
+    """
+    t = {**_QE_DEFS_V2.get(edit_type, {}), **(thresholds.get(edit_type) or {})}
+
+    def _as_int(v) -> int:
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
+
+    # (1) mesh integrity — hard gate, independent of edit success
+    if _as_int(judge_json.get("mesh_quality")) < t.get("min_mesh_quality", 4):
+        return False
+    # (2) edit execution — graded; fall back to v1 boolean if a v1-style verdict slipped through
+    es = judge_json.get("edit_strength")
+    if es is None:
+        es = 1 if judge_json.get("edit_executed", False) else 0
+    if _as_int(es) < t.get("min_edit_strength", 2):
+        return False
+    # (3) overall impression — soft floor
+    if _as_int(judge_json.get("visual_quality")) < t.get("min_visual_quality", 2):
+        return False
+    if not judge_json.get("correct_region", False):
+        return False
+    if t.get("require_preserve_other") and not judge_json.get("preserve_other", False):
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Gate-E judge v3 — v1's STRICT semantic judging (unchanged edit quality bar),
+# PLUS the 2D EDIT REFERENCE / INPUT condition images as extra visual input,
+# PLUS a hard mesh-integrity gate via artifact_free (which v1 emits but ignores).
+# Rationale: v2's graded/lenient execution let identity-destroying ghost edits
+# through and hallucinated "pristine" on broken meshes; v1's critical read is
+# better. So keep v1 verbatim and only (a) give it the reference image and
+# (b) make artifact_free actually gate, with a stronger see-through-hole prompt.
+# ---------------------------------------------------------------------------
+JUDGE_SYSTEM_PROMPT_V3 = """You are a 3D-edit quality judge.
+
+INPUT (images, in order):
+  Image 1 = a 2x5 collage of ONE 3D object.
+    TOP row    = BEFORE (5 views)
+    BOTTOM row = AFTER  (5 views, same camera per column)
+  Image 2 (optional) = the 2D EDIT REFERENCE: the intended appearance the AFTER
+    object was conditioned on. It shows the target part as a SOLID, complete
+    shape. Use it as ground truth for what the AFTER geometry SHOULD look like.
+  Image 3 (optional) = the 2D INPUT: the original object before the edit.
+  The user message supplies: edit_type, edit_prompt, object description,
+  target part label + description, and one type-specific extra
+  (new_part_desc | factor | target_material | target_color | target_style).
+
+WHAT SHOULD CHANGE vs MUST NOT CHANGE (by edit_type):
+  deletion      change: target part is REMOVED (gone in AFTER)
+                keep:   ALL other parts intact; no holes, no orphan stubs.
+  addition      change: target part is ADDED at its natural location
+                keep:   ALL other parts intact; no duplicates, no clipping.
+  modification  change: SHAPE / SILHOUETTE of target part
+                keep:   colour, material, position; ALL other parts intact
+  scale         change: SIZE of target part (shrinks by factor; still attached)
+                keep:   shape of target part; ALL other parts intact
+  material      change: SURFACE FINISH of target part (e.g. wood -> steel)
+                keep:   geometry of ALL parts; colour broadly similar
+  color         change: HUE / SHADE of target part
+                keep:   shape + material type of ALL parts; no colour bleed
+  global        change: WHOLE-OBJECT art style / rendering aesthetic
+                keep:   underlying geometry + structure still recognisable
+
+TASK:
+  1. Locate the target region in BEFORE from the part label + description.
+     For *addition* verify it APPEARS in AFTER; for global it is the whole object.
+  2. For each column compare same-camera BEFORE vs AFTER: did "what should
+     change" change, and did anything in "must not change" change?
+  3. SCAN the AFTER closely for mesh damage (see MESH INTEGRITY below) and set
+     artifact_free accordingly.
+  4. Apply HARD_FAIL rules (R1); if any triggers, set edit_executed=false.
+  5. Emit ONE JSON object per the OUTPUT schema, no prose, no fences.
+
+MESH INTEGRITY (drives artifact_free — judge this on the AFTER geometry):
+  Scan ALL 5 AFTER views CLOSELY for:
+    SEE-THROUGH HOLES / punctures — a spot on a surface that should be solid
+      where you can see through to the background or the part's inner back-face
+      (reads as a darker cavity or a window of background colour INSIDE the
+      silhouette). THIN-SHELL parts (sleeves, capes, skirts, wings) are the
+      usual offenders — look hard at them and cross-check Image 2: if the
+      reference shows a solid filled part but the AFTER shows a gap there, that
+      is a hole.
+    torn / ripped / missing-face surfaces, open shells,
+    floating disconnected fragments or blobs,
+    broken / shattered / collapsed structure,
+    DUPLICATED / GHOST geometry (a second copy of the object or part, extra
+      heads / limbs, doubled silhouette),
+    jagged stubs at a deletion site, interpenetration / clipping.
+  artifact_free = true ONLY if NONE of the above is present. A single clear
+  see-through hole, tear, floating fragment, or ghost duplicate => artifact_free
+  = false.
+
+OUTPUT: ONE valid JSON object only. First character must be "{" and last "}".
+{
+  "edit_executed":      <true|false>,
+  "correct_region":     <true|false>,
+  "preserve_other":     <true|false>,
+  "visual_quality":     <1-5>,
+  "artifact_free":      <true|false>,
+  "reason":             "<one sentence explaining your verdict>",
+  "prompt_quality":     <1-5>,
+  "improved_prompt":    "<imperative rewrite of the original prompt>",
+  "improved_after_desc":"<concise description of the AFTER object>"
+}
+
+RULES:
+  R1. HARD_FAIL => edit_executed=false:
+        * AFTER is visually identical to BEFORE (any edit_type).
+        * a DUPLICATE / GHOST copy of the object or part appeared (e.g. a
+          second figure, extra heads/limbs, doubled body).
+        * deletion:     target part still visible, OR a different part removed.
+        * addition:     target part still absent, OR an unrelated part appeared,
+                        OR an existing part deleted/altered to make room.
+        * modification: only colour/material changed, shape identical.
+        * scale:        target part unchanged in size OR grown.
+        * material:     geometry altered OR surface finish unchanged.
+        * color:        geometry or material type changed OR hue unchanged.
+        * global:       underlying structure no longer recognisable.
+  R2. correct_region = change localised to the named target part; for global
+      applied consistently across all 5 views; deletion removed region matches;
+      addition new part at its natural attachment site.
+  R3. preserve_other = every OTHER part intact in shape and position (global:
+      "structure + part count preserved"). Hard-fail if a non-target part
+      shifted, duplicated, lost colour, gained holes, or sprouted seams.
+      Minor lighting/shading shifts are acceptable.
+  R4. visual_quality in [1..5]: 1=terrible, 2=poor, 3=acceptable, 4=good,
+      5=excellent. Penalise broken meshes, see-through holes, floating blobs,
+      seam artefacts, ghost duplicates, per-view inconsistency. A result with
+      any clear mesh defect must NOT score above 3.
+  R5. prompt_quality rates how precisely the ORIGINAL prompt matches what
+      happened (1..5). improved_prompt is an imperative rewrite matching the
+      observed AFTER; if BEFORE == AFTER write "No change observed - <diagnosis>".
+      For addition phrase as a natural "Add <part> to <site>" instruction.
+  R6. All output fields in English only.
+"""
+
+
+# v3 defaults = v1 defaults (strict edit bar: min_visual_quality 3) PLUS a hard
+# artifact_free requirement. Overridable per type via qc.thresholds_by_type.
+_QE_DEFS_V3 = {et: {**v, "require_artifact_free": True} for et, v in _QE_DEFS.items()}
+
+
+def _passes_quality_thresholds_v3(judge_json: dict, edit_type: str, thresholds: dict) -> bool:
+    """v3 pass logic — IDENTICAL to v1 (edit_executed + visual_quality +
+    correct_region + preserve_other), with ONE added hard gate: artifact_free.
+
+    The edit-quality bar is unchanged from v1 (no relaxation). Mesh damage is
+    tightened by requiring artifact_free=true. See ``JUDGE_SYSTEM_PROMPT_V3``.
+    """
+    t = {**_QE_DEFS_V3.get(edit_type, {}), **(thresholds.get(edit_type) or {})}
+    # --- v1 logic, verbatim ---
+    if not judge_json.get("edit_executed", False):
+        return False
+    try:
+        vq = int(judge_json.get("visual_quality", 0))
+    except (TypeError, ValueError):
+        vq = 0
+    if vq < t.get("min_visual_quality", 3):
+        return False
+    if not judge_json.get("correct_region", False):
+        return False
+    if t.get("require_preserve_other") and not judge_json.get("preserve_other", False):
+        return False
+    # --- added hard mesh-integrity gate ---
+    if t.get("require_artifact_free", True) and not judge_json.get("artifact_free", False):
+        return False
+    return True
+
+
+def _resolve_judge(judge_version: "str | None"):
+    """Map cfg judge_version → (system_prompt, default_defs, pass_fn)."""
+    v = str(judge_version or "v1").lower()
+    if v == "v2":
+        return JUDGE_SYSTEM_PROMPT_V2, _QE_DEFS_V2, _passes_quality_thresholds_v2
+    if v == "v3":
+        return JUDGE_SYSTEM_PROMPT_V3, _QE_DEFS_V3, _passes_quality_thresholds_v3
+    return JUDGE_SYSTEM_PROMPT, _QE_DEFS, _passes_quality_thresholds
+
+
 def _load_before_view_images(ctx) -> "list | None":
     """5 before-state BGR images at the named views.
 
@@ -1899,6 +2114,126 @@ RULES:
 """
 
 
+# ---------------------------------------------------------------------------
+# Gate-E judge v2 — mesh-integrity-first, graded (thresholded) execution.
+# Parallel to v1 (above); selected per-run via cfg["qc"]["judge_version"]="v2".
+# v1 stays the default and is untouched, so old verdicts remain reproducible.
+# Two independent graded axes replace v1's harsh binary edit_executed gate:
+#   * mesh_quality   (1-5)  — STRICT hard gate on geometric well-formedness
+#   * edit_strength  (0-5)  — LENIENT graded gate on how much of the edit landed
+# ---------------------------------------------------------------------------
+JUDGE_SYSTEM_PROMPT_V2 = """You are a 3D-edit quality judge (v2: mesh-integrity-first, graded execution).
+
+INPUT (images, in order):
+  Image 1 = a 2x5 collage of ONE 3D object.
+    TOP row    = BEFORE (5 views)
+    BOTTOM row = AFTER  (5 views, same camera per column)
+  Image 2 (optional) = the 2D EDIT REFERENCE: the intended appearance the AFTER
+    object was conditioned on. It shows the target part as a SOLID, complete
+    shape. Use it as ground truth for what the AFTER geometry SHOULD look like.
+  Image 3 (optional) = the 2D INPUT: the original object before the edit.
+  The user message supplies: edit_type, edit_prompt, object description,
+  target part label + description, and one type-specific extra
+  (new_part_desc | factor | target_material | target_color | target_style).
+
+WHAT SHOULD CHANGE vs MUST NOT CHANGE (by edit_type):
+  deletion      change: target part REMOVED ; keep: all other parts intact,
+                        attachment site cleanly closed (no jagged stub)
+  addition      change: target part ADDED at its natural site ; keep: all other
+                        parts intact, no duplicates, no clipping
+  modification  change: SHAPE / SILHOUETTE of target part ; keep: colour,
+                        material, position; all other parts intact
+  scale         change: SIZE of target part (shrinks) ; keep: its shape; others intact
+  material      change: SURFACE FINISH of target part ; keep: geometry of all
+                        parts, colour broadly similar
+  color         change: HUE / SHADE of target part ; keep: shape + material of all parts
+  global        change: whole-object art style ; keep: underlying geometry recognisable
+
+TWO INDEPENDENT AXES — score them SEPARATELY, never let one bleed into the other:
+  (1) MESH INTEGRITY  -> mesh_quality [1..5]
+      Is the AFTER geometry physically well-formed, IRRESPECTIVE of whether the
+      edit succeeded?  Scan ALL 5 AFTER views CLOSELY (zoom into each part) for:
+        SEE-THROUGH HOLES / punctures — a spot on a surface that should be solid
+          where you can see through to the background or to the part's inner
+          back-face (often reads as a darker cavity or a window of background
+          colour inside the silhouette). THIN-SHELL parts (sleeves, capes,
+          skirts, wings) are the usual offenders — look hard at them.
+        torn or ripped surfaces, missing faces, open shells,
+        floating disconnected fragments or blobs detached from the body,
+        broken / shattered / melted / collapsed structure,
+        jagged stubs left at a deletion site,
+        interpenetration / clipping of one part through another.
+      Cross-check against Image 2 (EDIT REFERENCE): if the reference shows the
+      target part as a solid filled surface but the AFTER render shows a
+      hole / gap / see-through patch there, that is a mesh defect — record it.
+      mesh_quality scale:
+        1 = badly broken (large holes, shattered, floating chunks, collapsed)
+        2 = clearly damaged (a visible see-through hole/tear, or a detached fragment)
+        3 = minor defects (small puncture or slight stub, still mostly coherent)
+        4 = clean, no see-through holes, no visible defects
+        5 = clean AND crisp (well-formed, solid surfaces in every view)
+      A single clear see-through hole caps mesh_quality at 2.
+  (2) EDIT EXECUTION  -> edit_strength [0..5]
+      How much of the REQUESTED change actually happened?
+        0 = AFTER target region indistinguishable from BEFORE (no attempt)
+        1 = faint / partial change in the right direction
+        2 = partial but clearly under-done
+        3 = requested change recognisable though imperfect
+        4 = change clearly and correctly applied
+        5 = change fully and precisely applied per the instruction
+      Be LENIENT: a recognisable, plausible attempt in the right direction
+      scores >=3 even if not perfect.  Score 0 ONLY when nothing changed.
+
+TASK:
+  1. Locate the target region in BEFORE (for addition it is ABSENT in BEFORE ->
+     verify it APPEARS in AFTER; for global the target is the whole object).
+  2. Column by column, compare same-camera BEFORE vs AFTER.
+  3. Score mesh_quality and edit_strength INDEPENDENTLY per the scales above.
+  4. Judge correct_region and preserve_other.
+  5. Emit ONE JSON object per the schema, no prose, no fences.
+
+OUTPUT: ONE valid JSON object only. First character must be "{" and last "}".
+{
+  "edit_strength":       <0-5>,
+  "mesh_quality":        <1-5>,
+  "mesh_defects":        ["<hole|torn_surface|floating_fragment|disconnected|broken|jagged_stub|interpenetration|non_watertight>", ...],
+  "correct_region":      <true|false>,
+  "preserve_other":      <true|false>,
+  "visual_quality":      <1-5>,
+  "edit_executed":       <true|false>,
+  "artifact_free":       <true|false>,
+  "reason":              "<one sentence; mention BOTH the mesh state and the edit state>",
+  "prompt_quality":      <1-5>,
+  "improved_prompt":     "<imperative rewrite of the original prompt>",
+  "improved_after_desc": "<concise description of the AFTER object>"
+}
+
+RULES:
+  R1. mesh_quality is judged ONLY on geometric well-formedness of AFTER, NEVER on
+      whether the edit matched the instruction.  A perfectly-executed edit on a
+      torn mesh still scores LOW mesh_quality; a clean mesh that barely changed
+      still scores HIGH mesh_quality.
+  R2. edit_strength is judged ONLY on how much of the requested change happened,
+      and is NEVER penalised for mesh defects.  Do NOT hard-fail a partial edit —
+      grade it.
+  R3. mesh_defects lists every defect class you actually see (empty list [] if
+      none).  Set artifact_free = (mesh_defects is empty AND mesh_quality >= 4).
+  R4. correct_region = change localised to the named target part (global: applied
+      consistently across all 5 views; deletion: removed region matches the named
+      part; addition: new part at its natural attachment site, not floating).
+  R5. preserve_other = every OTHER part intact in shape and position (global:
+      structure + part count preserved).  Minor lighting/shading shifts are OK.
+  R6. visual_quality is an overall-impression score [1..5]; secondary to
+      mesh_quality and edit_strength.
+  R7. edit_executed = (edit_strength >= 1).  [Kept only for schema compatibility.]
+  R8. prompt_quality rates how precisely the ORIGINAL prompt matches what actually
+      happened (1..5).  improved_prompt is an imperative rewrite matching the
+      observed AFTER; if edit_strength == 0 write "No change observed - <diagnosis>".
+      For addition, phrase as a natural "Add <part> to <site>" instruction.
+  R9. All output fields in English only.
+"""
+
+
 def build_quality_judge_prompt(
     edit_type: str,
     edit_prompt: str,
@@ -2017,6 +2352,40 @@ def extract_quality_judge_json(content: str) -> "dict | None":
     return None
 
 
+def _load_edit_condition_imgs(ctx, edit_id: str) -> "list[tuple[str, bytes]]":
+    """Load the 2D condition images for an edit as captioned reference inputs.
+
+    Returns ``[(caption, png_bytes), ...]`` for whichever of
+    ``edits_2d/{edit_id}_edited.png`` (the EDIT REFERENCE the 3D edit was
+    conditioned on) and ``edits_2d/{edit_id}_input.png`` (the original) exist.
+    Empty list if the directory/files are missing (judge falls back to the
+    BEFORE/AFTER collage alone).
+    """
+    out: "list[tuple[str, bytes]]" = []
+    try:
+        d = getattr(ctx, "edits_2d_dir", None)
+        if d is None:
+            return out
+        from pathlib import Path as _P
+        d = _P(d)
+        edited = d / f"{edit_id}_edited.png"
+        inp = d / f"{edit_id}_input.png"
+        if edited.is_file():
+            out.append((
+                "Image 2 = the 2D EDIT REFERENCE: the intended appearance the "
+                "AFTER object was conditioned on. The AFTER render should match "
+                "this; treat it as ground truth for the target part's solid shape.",
+                edited.read_bytes()))
+        if inp.is_file():
+            out.append((
+                "Image 3 = the 2D INPUT: the original object before the edit "
+                "(for reference of the untouched parts).",
+                inp.read_bytes()))
+    except Exception as _e:
+        _LOG_QE.debug("[gate_quality] condition-img load failed (%s): %s", edit_id, _e)
+    return out
+
+
 async def _call_quality_judge_vlm(
     client,
     model: str,
@@ -2029,22 +2398,41 @@ async def _call_quality_judge_vlm(
     edit_params: "dict | None" = None,
     max_retries: int = 4,
     max_tokens: int = 1024,
+    judge_version: "str | None" = "v1",
+    ref_imgs: "list[tuple[str, bytes]] | None" = None,
 ) -> "dict | None":
     """Async VLM judge call with retry.
 
-    Uses the single unified ``JUDGE_SYSTEM_PROMPT`` as the system message
-    and ``build_quality_judge_prompt(...)`` to build the per-edit user
+    Uses the unified system prompt for the selected ``judge_version`` (v1 =
+    ``JUDGE_SYSTEM_PROMPT``, v2 = ``JUDGE_SYSTEM_PROMPT_V2``) as the system
+    message and ``build_quality_judge_prompt(...)`` for the per-edit user
     message, mirroring the alignment-gate pattern.
+
+    ``ref_imgs`` (v2): extra ``(caption, png_bytes)`` reference images appended
+    after the BEFORE/AFTER collage — typically the 2D EDIT REFERENCE (the FLUX
+    ``_edited.png`` the 3D edit was conditioned on) and the 2D INPUT.  They give
+    the judge a visual target for "what the AFTER should look like", so it can
+    flag see-through holes / broken surfaces where the reference shows a solid
+    part — something pure text context cannot convey.
     """
     b64 = _base64.b64encode(img_bytes).decode("utf-8")
-    # Single unified system prompt for every edit type → the VLM reuses
-    # its KV cache across consecutive judge calls.
-    system_prompt = JUDGE_SYSTEM_PROMPT
+    # Single unified system prompt per version for every edit type → the VLM
+    # reuses its KV cache across consecutive judge calls.
+    system_prompt, _, _ = _resolve_judge(judge_version)
     user_text = build_quality_judge_prompt(
         edit_type, edit_prompt, object_desc, part_label,
         target_part_desc=target_part_desc,
         edit_params=edit_params or {},
     )
+    # Pre-encode any reference images once (constant across retries).
+    ref_blocks = []
+    for cap, raw in (ref_imgs or []):
+        if not raw:
+            continue
+        rb64 = _base64.b64encode(raw).decode("utf-8")
+        ref_blocks.append({"type": "text", "text": cap})
+        ref_blocks.append({"type": "image_url",
+                           "image_url": {"url": f"data:image/png;base64,{rb64}"}})
     strict_suffix = (
         "\n\nIf you already wrote analysis above, IGNORE it for the parser: "
         "output ONE new line that is ONLY the JSON object, starting with { and ending with }."
@@ -2056,15 +2444,19 @@ async def _call_quality_judge_vlm(
         if attempt > 0:
             sys_msg += "\n\nYour reply must be a single JSON object; no chain-of-thought."
         try:
+            content_blocks = [
+                {"type": "text",
+                 "text": "Image 1 = the 2x5 BEFORE(top)/AFTER(bottom) render collage to judge."},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            ]
+            content_blocks.extend(ref_blocks)
+            content_blocks.append({"type": "text", "text": text})
             create_kw: dict = dict(
                 model=model,
                 messages=[
                     {"role": "system", "content": sys_msg},
-                    {"role": "user", "content": [
-                        {"type": "image_url",
-                         "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                        {"type": "text", "text": text},
-                    ]},
+                    {"role": "user", "content": content_blocks},
                 ],
                 temperature=0.1, max_tokens=max_tokens, timeout=300,
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
@@ -2106,6 +2498,7 @@ async def _judge_edit_quality(
     target_part_desc: str = "",
     edit_params: "dict | None" = None,
     swap_collage: bool = False,
+    judge_version: "str | None" = "v1",
 ) -> "tuple[bool, int, int]":
     """Judge one edit.  Returns ``(ok, n_pass_delta, n_fail_delta)``.
 
@@ -2131,11 +2524,19 @@ async def _judge_edit_quality(
         _update_edit_stage(ctx, edit_id, edit_type, "gate_e", status="fail")
         return False, 0, 1
 
+    sys_prompt_v, default_defs_v, pass_fn_v = _resolve_judge(judge_version)
+    # v2: also hand the judge the 2D EDIT REFERENCE (FLUX _edited.png the 3D edit
+    # was conditioned on) + the 2D INPUT, so it has a visual target for "what the
+    # AFTER should look like" and can spot see-through holes / broken surfaces.
+    ref_imgs = None
+    if str(judge_version or "v1").lower() in ("v2", "v3"):
+        ref_imgs = _load_edit_condition_imgs(ctx, edit_id)
     j = await _call_quality_judge_vlm(
         client, vlm_model, coll,
         edit_prompt=prompt, edit_type=edit_type,
         object_desc=obj_desc, part_label=part_label,
         target_part_desc=target_part_desc, edit_params=edit_params,
+        judge_version=judge_version, ref_imgs=ref_imgs,
     )
     if j is None:
         _update_edit_gate(ctx, edit_id, edit_type, "E",
@@ -2144,13 +2545,36 @@ async def _judge_edit_quality(
         _update_edit_stage(ctx, edit_id, edit_type, "gate_e", status="fail")
         return False, 0, 1
 
-    ok = _passes_quality_thresholds(j, edit_type, thresholds)
+    ok = pass_fn_v(j, edit_type, thresholds)
     _update_edit_gate(ctx, edit_id, edit_type, "E",
                       vlm_result={"pass": ok,
                                   "score": round(j.get("visual_quality", 0) / 5.0, 2),
                                   "reason": j.get("reason", "")})
     _update_edit_stage(ctx, edit_id, edit_type, "gate_e",
                        status="pass" if ok else "fail")
+    # Persist the FULL judge JSON (all booleans + scores) + the exact prompt that
+    # produced it, next to the edit artefacts, so the verdict is fully auditable
+    # downstream (edit_status.json only keeps pass/score/reason).
+    try:
+        edit_dir.mkdir(parents=True, exist_ok=True)
+        (edit_dir / "gate_e_judge.json").write_text(json.dumps({
+            "edit_id": edit_id,
+            "edit_type": edit_type,
+            "pass": ok,
+            "judge_version": str(judge_version or "v1").lower(),
+            "condition_imgs": [c for c, _ in (ref_imgs or [])],
+            "thresholds": {**default_defs_v.get(edit_type, {}),
+                           **(thresholds.get(edit_type) or {})},
+            "judge": j,
+            "prompt": {
+                "system": sys_prompt_v,
+                "user": build_quality_judge_prompt(
+                    edit_type, prompt, obj_desc, part_label,
+                    target_part_desc=target_part_desc, edit_params=edit_params),
+            },
+        }, ensure_ascii=False, indent=2))
+    except Exception as _e:
+        _LOG_QE.debug("[gate_quality] gate_e_judge dump failed (%s): %s", edit_id, _e)
     # Persist VLM-suggested rewrite next to the edit artefacts.  Always written
     # so downstream export can reuse it; only consumed for addition where the
     # original prompt is mechanically inverted from the deletion prompt.
@@ -2194,6 +2618,7 @@ async def _run_quality_gate_for_object(
     force: bool,
     log: "logging.Logger",
     only_edit_types: "set[str] | None" = None,
+    judge_version: "str | None" = "v1",
 ) -> dict:
     """Judge all edits for one object via Gate E (VLM visual quality).
 
@@ -2282,6 +2707,7 @@ async def _run_quality_gate_for_object(
             target_part_desc=spec.target_part_desc,
             edit_params=spec.edit_params,
             swap_collage=False,
+            judge_version=judge_version,
         )
         n_pass += dp; n_fail += df
 
@@ -2310,6 +2736,7 @@ async def _run_quality_gate_for_object(
             target_part_desc=meta.get("target_part_desc") or "",
             edit_params={},
             swap_collage=True,
+            judge_version=judge_version,
         )
         n_pass += dp; n_fail += df
 
@@ -2353,7 +2780,12 @@ async def run_gate_quality(
     if not vlm_urls:
         raise ValueError("vlm_urls must not be empty")
     log = logger or _LOG_QE
-    thresholds = (cfg.get("qc") or {}).get("thresholds_by_type") or _QE_DEFS
+    qc = cfg.get("qc") or {}
+    judge_version = str(qc.get("judge_version") or "v1").lower()
+    _, _default_defs, _ = _resolve_judge(judge_version)
+    thresholds = qc.get("thresholds_by_type") or _default_defs
+    log.info("[gate_quality] judge_version=%s (mesh-strict + graded execution)"
+             if judge_version == "v2" else "[gate_quality] judge_version=%s", judge_version)
     ctxs = list(ctxs)
     sem = _asyncio.Semaphore(concurrency)
 
@@ -2362,6 +2794,7 @@ async def run_gate_quality(
             return await _run_quality_gate_for_object(
                 ctx, vlm_urls[i % len(vlm_urls)], vlm_model, thresholds, force, log,
                 only_edit_types=only_edit_types,
+                judge_version=judge_version,
             )
 
     return await _asyncio.gather(*[_run_one(i, c) for i, c in enumerate(ctxs)])

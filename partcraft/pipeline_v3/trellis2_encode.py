@@ -239,43 +239,11 @@ def _slat_from_arrays(feats: np.ndarray, coords: np.ndarray):
     return sp.SparseTensor(feats=f, coords=c)
 
 
-def _render_overview_at_encode(ctx: ObjectContext, enc_out: dict, pipeline,
-                               envmap, p25_cfg: dict, logger) -> None:
-    """Decode the just-encoded latents → unified PBR overview (+ debug + gate
-    before views).  RGB = decoded latents (realistic); segmentation = part-mesh
-    flat palette.  Saves phase1/overview.png (the format gen_edits/gate-A read),
-    viewpoints.json, gate_views/before_view_*, and phase1/debug/*."""
-    import json as _json
-    import cv2 as _cv2
-    from PIL import Image
-    from partcraft.pipeline_v3 import trellis2_ovox_render as OVR
-    from partcraft.render import ovox_views as _ov
-    from partcraft.render.overview import stitch_two_rows
-
-    shape_slat = _slat_from_arrays(enc_out["shape_feats"], enc_out["shape_coords"])
-    tex_slat = _slat_from_arrays(enc_out["tex_feats"], enc_out["tex_coords"])
-    res = int(p25_cfg.get("trellis2_gate_view_res", 512))
-    r = OVR.render_pbr_overview(pipeline, ctx.mesh_npz, shape_slat, tex_slat,
-                                envmap, resolution=res)
-
-    top = [_cv2.cvtColor(r["rgb"][v], _cv2.COLOR_RGB2BGR) for v in _ov.VIEW_ORDER]
-    bot = [_cv2.cvtColor(r["seg"][v], _cv2.COLOR_RGB2BGR) for v in _ov.VIEW_ORDER]
-    final = stitch_two_rows(top, bot)
-    ctx.phase1_dir.mkdir(parents=True, exist_ok=True)
-    _cv2.imwrite(str(ctx.overview_path), final)
-    (ctx.phase1_dir / "viewpoints.json").write_text(_json.dumps(
-        {"views": list(_ov.VIEW_ORDER), "cameras": r["cam"], "part_ids": r["part_ids"]}, indent=2))
-
-    gv = ctx.dir / "gate_views"; gv.mkdir(parents=True, exist_ok=True)
-    # stage-organised debug viz: <obj>/debug/<stage>/...
-    dbg = ctx.dir / "debug" / "encode"; dbg.mkdir(parents=True, exist_ok=True)
-    for v in _ov.VIEW_ORDER:
-        Image.fromarray(r["rgb"][v]).save(gv / f"before_view_{v}.png")
-        Image.fromarray(r["rgb"][v]).save(dbg / f"rgb_{v}.png")
-        Image.fromarray(r["seg"][v]).save(dbg / f"seg_{v}.png")
-    _cv2.imwrite(str(dbg / "overview.png"), final)
-    logger.info("[s4b] %s unified PBR overview + %d views + debug saved",
-                ctx.obj_id, len(_ov.VIEW_ORDER))
+# NOTE: the old _render_overview_at_encode (render_pbr_overview path) was removed.
+# Encode now renders gate_views via _render_before_named_views (PBR decode +
+# render_sample, == the post-edit "after" render) and builds the overview as PBR
+# RGB (reused gate_views) + robust o-voxel seg — see _encode_one below.  The
+# render_pbr_overview seg pass rasterised raw part-meshes and crashed CUDA.
 
 
 def _encode_one(ctx: ObjectContext, encoders: dict, p25_cfg: dict, logger,
@@ -320,11 +288,44 @@ def _encode_one(ctx: ObjectContext, encoders: dict, p25_cfg: dict, logger,
                         ctx.obj_id, edit_res, int(e2["shape_coords"].shape[0]),
                         edit_res // 16, d)
 
-    if pipeline is not None and enc_out is not None:
-        try:
-            _render_overview_at_encode(ctx, enc_out, pipeline, envmap, p25_cfg, logger)
-        except Exception as e:
-            logger.warning("[s4b] %s overview render failed: %s", ctx.obj_id, e)
+    # Render the named source views (gate_views/before_view_*) at ENCODE time via
+    # the SAME robust path as the post-edit "after" render: decode the P1 latents
+    # → mesh → render_sample (PbrMeshRenderer).  This is exactly what trellis2_3d
+    # does for before/after (_render_before_named_views) and is production-proven.
+    # It deliberately AVOIDS render_pbr_overview's extra part-palette SEGMENTATION
+    # pass, which hit CUDA error 700 on some degenerate part-meshes and corrupted
+    # the worker's CUDA context (cascading all subsequent renders to failure).
+    # flux_2d then just LOADS these PBR PNGs — no on-the-fly render.  (gate-A's
+    # RGB+seg overview is still produced by gen_edits' o-voxel backfill; the seg
+    # render is the fragile part we keep off the GPU-render hot path.)
+    if pipeline is not None:
+        gd = ctx.dir / "gate_views"
+        if force or not (gd / "before_view_front.png").is_file():
+            try:
+                from partcraft.pipeline_v3.trellis2_3d import _render_before_named_views
+                _render_before_named_views(pipeline, ctx, gd, p25_cfg, logger)
+            except Exception as e:
+                logger.warning("[s4b] %s before-views render failed: %s", ctx.obj_id, e)
+        # Build gate-A's overview.png = PBR RGB top (REUSE the gate_views just
+        # rendered — RGB is rendered ONCE, no redundant o-voxel RGB voxelisation)
+        # + robust o-voxel SEG bottom (render_overview_png(skip_rgb)).  If the PBR
+        # views are missing, leave the overview to gen_edits' o-voxel backfill.
+        if force or not ctx.overview_path.is_file():
+            try:
+                from PIL import Image as _Img
+                from partcraft.render import ovox_views as _ov2
+                from partcraft.pipeline_v3.vlm_core import render_overview_png as _rop
+                pngs = [gd / f"before_view_{v}.png" for v in _ov2.VIEW_ORDER]
+                if all(p.is_file() for p in pngs):
+                    rgb_top = [np.array(_Img.open(p).convert("RGB")) for p in pngs]
+                    ctx.phase1_dir.mkdir(parents=True, exist_ok=True)
+                    png = _rop(ctx.mesh_npz,
+                               save_viewpoints=ctx.phase1_dir / "viewpoints.json",
+                               rgb_override=rgb_top)
+                    ctx.overview_path.write_bytes(png)
+                    logger.info("[s4b] %s overview = PBR RGB + o-voxel seg", ctx.obj_id)
+            except Exception as e:
+                logger.warning("[s4b] %s overview build failed: %s", ctx.obj_id, e)
     return out
 
 
@@ -368,8 +369,14 @@ def run(
     n_ok = n_fail = n_skip = 0
     ctxs = list(ctxs)
     for ctx in ctxs:
-        ov_done = (not render_overview) or (ctx.overview_path.is_file()
-                                            and ctx.overview_path.stat().st_size > 1000)
+        # When render_overview is on, the object is only "done" once the named
+        # source views (gate_views/before_view_*) exist — flux_2d loads these
+        # instead of doing a concurrent on-the-fly render.  Check the views, NOT
+        # phase1/overview.png (gate-A writes that separately), so an already-
+        # encoded object still gets its views rendered (without re-encoding).
+        ov_done = (not render_overview) or (
+            (ctx.dir / "gate_views" / "before_view_front.png").is_file()
+            and ctx.overview_path.is_file())
         if _p1_complete(ctx, edit_res) and ov_done and not force:
             n_skip += 1
             update_step(ctx, "s4b_t2_encode", status=STATUS_OK, reason="exists")

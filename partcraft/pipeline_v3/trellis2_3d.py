@@ -98,8 +98,20 @@ def _ensure_pipeline(p25_cfg: dict, logger):
     ckpt = p25_cfg.get("trellis2_ckpt", "/mnt/zsn/ckpts/TRELLIS.2-4B")
     logger.info("[s5] loading Trellis2ImageTo3DPipeline from %s", ckpt)
     pipeline = Trellis2ImageTo3DPipeline.from_pretrained(ckpt)
-    pipeline.cuda()
-    logger.info("[s5] TRELLIS.2 pipeline ready")
+
+    # Residency vs low-VRAM offload.  With low_vram=True (the upstream default)
+    # EVERY flow/decoder is shuttled CPU→GPU before each sample and GPU→CPU
+    # after — repeated per object, per stage (SS/shape/shape_lr/tex + decoders
+    # + DINOv3).  On these 144 GB cards there is ample room to keep the whole
+    # ~4B pipeline resident, eliminating all that PCIe churn.  Both the vendored
+    # sampler AND our edit stages honour pipeline.low_vram, so flipping it off
+    # is consistent end-to-end.  Override with services.image_edit.low_vram:true
+    # on memory-tight machines.
+    low_vram = bool(p25_cfg.get("low_vram", False))
+    pipeline.low_vram = low_vram
+    pipeline.cuda()  # low_vram=False → moves all models onto GPU, resident
+    logger.info("[s5] TRELLIS.2 pipeline ready  (low_vram=%s → %s)",
+                low_vram, "offload per-stage" if low_vram else "all models resident")
     return pipeline
 
 

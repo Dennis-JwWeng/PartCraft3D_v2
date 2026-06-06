@@ -1,6 +1,6 @@
 # Runbook — TRELLIS.1-SS native (in-process) masked 3D edit @512
 
-最后更新:2026-06-05 · 分支 `main`(已定稿:此配置=唯一正式 config,输出 `data/Pxform_v2/prod`)
+最后更新:2026-06-06 · 分支 `main` · 生产用 **posthoc_no2dqc**(见下「⭐⭐」节);texrestore 仍作对照
 
 把「TRELLIS.1 SS mask 编辑」做成 trellis2 进程内的正式 S1 阶段(不再走 vinedresser3d 离线桥接)。
 单 conda 环境(`trellis2`)、单代码库(当前目录)、单次模型常驻即可端到端跑完带纹理的 3D 编辑。
@@ -20,6 +20,51 @@
 | 🟢 **管线脚本** | `run_pipeline_v3_shard_trellis2.sh`（内部 dispatch `python -m partcraft.pipeline_v3.run_trellis2`） |
 | 🟢 **配置(最优)** | `configs/pipeline_v3_trellis2_t1ss_native_r512_pad4_texrestore.yaml` |
 | 🟢 **runbook** | `docs/experiment/t1ss_native_runbook.md`（本文件） |
+
+---
+
+## ⭐⭐ 生产配置(no-2DQC + 全 posthoc + PBR 渲染)— 当前正式跑用这个
+
+`configs/pipeline_v3_trellis2_t1ss_native_r512_pad4_posthoc_no2dqc.yaml`,与上面的 texrestore 并列。三处关键差异 + 一套统一渲染:
+
+| 维度 | texrestore | **posthoc_no2dqc(本)** |
+|---|---|---|
+| **S2 SHAPE** | `perstep`(跑 flow inversion) | **`posthoc`** — 自由生成实心部件 + 硬贴 P1 编码 body latent;**跳过 invert_clean**(实测 ~1.22×/edit、编辑区更实、body 逐位精确) |
+| **S2 TEXTURE** | `posthoc`-restore | 同(本就不反演)→ **S2 全程零 flow inversion** |
+| **2D QC** | 有 `gate_2d`(Gate C) | **删除** — `build_prereq_map()` 自动把 `trellis2_3d` 的 prereq 从 `gate_c` 回退到 `gate_a`,每个 FLUX 2D 编辑都进 3D |
+| **输出根** | `data/Pxform_v2/prod` | **`data/Pxform_v2/prod_posthoc_no2dqc`** |
+
+**渲染(唯一一套,VLM 全程 PBR;旧的混杂渲染已删):**
+- before/after/gate-E:`decode_latent` + `render_sample`(PbrMeshRenderer)= `_render_before/after_named_views`。
+- **encode 阶段就把 `gate_views/before_view_*` 渲好**(PBR)→ flux 直接读图,**不再每线程实时 o-voxel 渲染**(那条会 segfault;毒 mesh 会撞 CUDA 700 级联)。开关 `trellis2_encode_render_overview: true`。
+- gate-A overview = 上行 **PBR RGB**(复用 gate_views)+ 下行 **o-voxel seg**(robust,`render_overview_from_ovox(skip_rgb=True)`;原始-mesh seg 光栅化才会崩,体素化 seg 不崩)。
+- 相机 `partcraft/render/ovox_views.py:NAMED_VIEWS`:front/right/back/left = **0/90/180/270 轴对齐 + 俯视 22°**(正对面,不再 ~45° 偏置的 3/4 侧身);`down` 保留。
+- 已删的死渲染:`_render_overview_at_encode`(render_pbr_overview 的 seg→CUDA 崩)、`prepare_input_image_ovox`(flux o-voxel)、`select_best_view`。
+
+**正式跑(GPU 2-7,tmux):**
+```bash
+cd /mnt/zsn/zsn_workspace/PartCraft3D_v2
+mkdir -p data/Pxform_v2/prod_posthoc_no2dqc
+tmux new -s prod00 -d
+tmux send-keys -t prod00 'OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 S1_PER_GPU_CONCURRENCY=4 SHARD=00 MACHINE_ENV=configs/machine/local_trellis2.env PIPELINE_GPUS="2,3,4,5,6,7" bash run_pipeline_v3_shard_trellis2.sh posthoc_shard00 configs/pipeline_v3_trellis2_t1ss_native_r512_pad4_posthoc_no2dqc.yaml 2>&1 | tee data/Pxform_v2/prod_posthoc_no2dqc/_run_shard00.log' Enter
+# 看进度: tmux attach -t prod00   （脱离: Ctrl-b 然后 d）
+```
+> `OMP_NUM_THREADS=1` 等:flux_2d 的 16 线程客户端避免原生库线程超额订阅崩溃的兜底。
+> 续跑只补缺失(encode 跳过已编码 latent,只补渲缺的 gate_views/overview);全 shard 改 `SHARD`/tag 即可。
+
+### ⚡ 提速(两个批处理杠杆,默认已开 — 144GB 卡)
+
+两处默认值原本为「小显存」调优,在这批 144GB 卡上白白浪费算力。已在代码里改成高吞吐默认,跑批直接带上即可。**注意:慢的根因不是 thinking 模式**(`enable_thinking:False` 在 Qwen3.6 上已生效,采样到的 raw.txt 0/159 含 `<think>`),而是下面两点没批处理 + 反复搬权重。
+
+| 杠杆 | 问题 | 改法 | 实测 |
+|---|---|---|---|
+| **gate_a / s1 每卡并发** | `gen_edits_image.py` 每个 VLM server 只有 1 个 consumer + `Semaphore(1)` → sglang `#running-req:1`、96% 利用率却只 ~35 req/min | env **`S1_PER_GPU_CONCURRENCY`(默认4)**:每卡起 N 个 consumer + `Semaphore(N)` + 哨兵×N;内联 gate_a 候选判别也跟着并发 → `#running-req` 16–21 | **35→261 req/min(~7.5×)**,gate_a ~5h→~40min |
+| **3D 编辑模型驻留** | `Trellis2ImageTo3DPipeline` 默认 `low_vram=True` → `cuda()` 几乎空操作,每对象每 stage 把 SS/shape/shape_lr/tex flow + decoder + DINOv3 在 CPU↔GPU 来回搬(纯 PCIe 浪费) | `trellis2_3d._ensure_pipeline` 读 `services.image_edit.low_vram`(**默认 `False`**)→ `cuda()` 前置 `pipeline.low_vram=False` → 全模型常驻 | 采样零搬运;`trellis2_preview` 是 `servers:none`,整张 144GB 给 TRELLIS,绰绰有余 |
+
+- 不爆显存:sglang KV 池由 `--mem-fraction-static` 静态预分配,并发超了**排队**不 OOM。
+- phase1 `max_tokens` 12288→4096(实测最长 2562 tok,纯省调度)。
+- 内存紧的机器回退:`S1_PER_GPU_CONCURRENCY=1` + config 里 `services.image_edit.low_vram: true`。
+- 细节见记忆 `v2-throughput-levers.md`。
 
 ---
 

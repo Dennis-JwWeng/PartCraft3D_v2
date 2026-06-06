@@ -49,24 +49,6 @@ from partcraft.io.hy3d_loader import HY3DPartDataset
 from partcraft.pipeline_v3.specs import EditSpec
 
 
-def select_best_view(obj_record, edit_part_ids: list[int]) -> int:
-    """Pick the perspective view where edit parts have most visible pixels."""
-    import numpy as np
-    transforms_data = obj_record.get_transforms()
-    frames = transforms_data["frames"]
-
-    best_view, best_count = 0, 0
-    for v in range(obj_record.num_views):
-        if v < len(frames) and frames[v].get("proj_type") == "ortho":
-            continue
-        mask = obj_record.get_mask(v)
-        count = sum(int(np.sum(mask == pid)) for pid in edit_part_ids)
-        if count > best_count:
-            best_count = count
-            best_view = v
-    return best_view
-
-
 def prepare_input_image(obj_record, view_id: int,
                         edit_part_ids: list[int] | None = None) -> bytes:
     """Load view from NPZ, composite RGBA onto white, return PNG bytes.
@@ -87,23 +69,9 @@ def prepare_input_image(obj_record, view_id: int,
     return buf.getvalue(), pil_img
 
 
-def prepare_input_image_ovox(mesh_npz_path, view_name: str):
-    """Render the FLUX-input image from the o-voxel at a named view.
-
-    Replaces the packed-image ``prepare_input_image`` for the o-voxel front-end:
-    voxelise the mesh, rasterise the named camera, composite onto white,
-    return ``(png_bytes, pil_img)`` at 518×518 — the same contract FLUX expects.
-    """
-    from pathlib import Path as _P
-    from PIL import Image
-    from partcraft.pipeline_v3.trellis2_ovox_render import render_mesh_named_view
-
-    rgb = render_mesh_named_view(_P(mesh_npz_path), view_name,
-                                 resolution=518, bg=(1.0, 1.0, 1.0))
-    pil_img = Image.fromarray(rgb).convert("RGB").resize((518, 518))
-    buf = io.BytesIO()
-    pil_img.save(buf, format="PNG")
-    return buf.getvalue(), pil_img
+# NOTE: prepare_input_image_ovox (flux's on-the-fly o-voxel render of the FLUX
+# input view) was removed.  flux_2d now loads the pre-rendered PBR
+# gate_views/before_view_<name>.png (process_one) — no per-thread GPU render.
 
 
 def check_edit_server(base_url: str):
@@ -377,40 +345,23 @@ def process_one(spec: EditSpec, dataset, client, output_dir: Path,
     result = {"edit_id": edit_id, "obj_id": spec.obj_id}
 
     try:
-        obj = dataset.load_object(spec.shard, spec.obj_id)
-        if spec.edit_type == "global":
-            edit_part_ids = []  # no specific part — whole object
-        else:
-            # deletion / modification / scale / material / color: use ALL
-            # selected_part_ids (group edits list every member id).
-            edit_part_ids = list(spec.selected_part_ids)
-
-        # 1. Select best view — gate-A's named view (front/right/back/left/down)
+        # INPUT image = the pre-rendered PBR source view written at ENCODE time
+        # (gate_views/before_view_<name>.png — realistic PbrMeshRenderer, the SAME
+        # render gate-A / gate-E see). flux_2d does NO rendering of its own: the
+        # old on-the-fly o-voxel path was both non-thread-safe (GL segfault under
+        # the 16-thread pool) AND a low-quality non-PBR render that would feed the
+        # VLM a worse image than the rest of the pipeline. Pure PNG-load → save →
+        # (concurrent) FLUX call, so threads only do thread-safe work.
         view_name = getattr(spec, "view_name", "") or ""
         result["view_id"] = view_name or getattr(spec, "npz_view", -1)
-
-        # 2. Prepare input image.  Prefer the unified PBR render saved by the
-        #    encode stage (gate_views/before_view_<name>.png — same realistic
-        #    render as the overview/gate-E); fall back to an on-the-fly o-voxel
-        #    render, then to the packed best-view (legacy specs).
-        if view_name:
-            import io as _io
-            from PIL import Image as _Image
-            saved = Path(output_dir).parent / "gate_views" / f"before_view_{view_name}.png"
-            if saved.is_file():
-                pil_img = _Image.open(saved).convert("RGB").resize((518, 518))
-                _b = _io.BytesIO(); pil_img.save(_b, format="PNG"); img_bytes = _b.getvalue()
-            else:
-                img_bytes, pil_img = prepare_input_image_ovox(obj.mesh_npz_path, view_name)
-        else:
-            if hasattr(spec, 'npz_view') and spec.npz_view >= 0:
-                best_view = spec.npz_view
-            else:
-                best_view = select_best_view(obj, edit_part_ids or
-                                             [p.part_id for p in obj.parts])
-            result["view_id"] = best_view
-            img_bytes, pil_img = prepare_input_image(
-                obj, best_view, edit_part_ids)
+        saved = Path(output_dir).parent / "gate_views" / f"before_view_{view_name}.png"
+        if not (view_name and saved.is_file()):
+            result["status"] = "error"
+            result["error"] = "missing_before_view"
+            return result
+        from PIL import Image as _Image
+        pil_img = _Image.open(saved).convert("RGB").resize((518, 518))
+        _b = io.BytesIO(); pil_img.save(_b, format="PNG"); img_bytes = _b.getvalue()
 
         input_path = output_dir / f"{edit_id}_input.png"
         pil_img.save(str(input_path))
