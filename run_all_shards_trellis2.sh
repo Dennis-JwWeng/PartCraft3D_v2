@@ -40,7 +40,7 @@ cd "$ROOT"
 
 SHARDS="${SHARDS:-00 01 02 03 04 05 06 07 08 09}"
 CONFIG="${CONFIG:-configs/pipeline_v3_trellis2_t1ss_native_r512_pad4_posthoc_no2dqc.yaml}"
-GPUS="${GPUS:-2,3,4,5,6,7}"
+GPUS="${GPUS:-0,1,2,3,4,5,6,7}"
 CONCURRENCY="${CONCURRENCY:-4}"
 MACHINE_ENV="${MACHINE_ENV:-configs/machine/local_trellis2.env}"
 CONTINUE_ON_FAIL="${CONTINUE_ON_FAIL:-0}"
