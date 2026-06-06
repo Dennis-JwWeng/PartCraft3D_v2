@@ -267,9 +267,9 @@ def _encode_one(ctx: ObjectContext, encoders: dict, p25_cfg: dict, logger,
     enc_out = None
     if force or not main_present:
         enc_out = encode_shape_tex_ss(encoders, ctx.mesh_npz, grid_size, canonical=canonical)
-        np.savez_compressed(out, feats=enc_out["shape_feats"], coords=enc_out["shape_coords"])
-        np.savez_compressed(d / "tex_slat.npz", feats=enc_out["tex_feats"], coords=enc_out["tex_coords"])
-        np.savez_compressed(d / "ss.npz", ss=enc_out["ss"])
+        np.savez(out, feats=enc_out["shape_feats"], coords=enc_out["shape_coords"])
+        np.savez(d / "tex_slat.npz", feats=enc_out["tex_feats"], coords=enc_out["tex_coords"])
+        np.savez(d / "ss.npz", ss=enc_out["ss"])
         logger.info("[s4b] %s encoded → shape+tex(%d tokens)+ss at %s",
                     ctx.obj_id, int(enc_out["shape_coords"].shape[0]), d)
 
@@ -282,8 +282,8 @@ def _encode_one(ctx: ObjectContext, encoders: dict, p25_cfg: dict, logger,
         if force or not (sc.is_file() and sc.stat().st_size > 0
                          and tc.is_file() and tc.stat().st_size > 0):
             e2 = encode_shape_tex_ss(encoders, ctx.mesh_npz, edit_res, canonical=canonical)
-            np.savez_compressed(sc, feats=e2["shape_feats"], coords=e2["shape_coords"])
-            np.savez_compressed(tc, feats=e2["tex_feats"], coords=e2["tex_coords"])
+            np.savez(sc, feats=e2["shape_feats"], coords=e2["shape_coords"])
+            np.savez(tc, feats=e2["tex_feats"], coords=e2["tex_coords"])
             logger.info("[s4b] %s grid-%d sidecar → shape+tex(%d tokens @%d³) at %s",
                         ctx.obj_id, edit_res, int(e2["shape_coords"].shape[0]),
                         edit_res // 16, d)
