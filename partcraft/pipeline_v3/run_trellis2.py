@@ -941,11 +941,9 @@ def main():
                           and args.gpus
                           and (phase_use_gpus or not run_stage)
                           and not args.single_gpu)
+        dispatch_rc = 0
         if wants_dispatch:
-            rc = dispatch_gpus(step, args.config, args)
-            if rc != 0:
-                LOG.error("[%s] dispatch_gpus returned rc=%d — aborting", step, rc)
-                exit_rc = rc
+            dispatch_rc = dispatch_gpus(step, args.config, args)
         else:
             run_step(step, ctxs, cfg, args, post_object_fn=_post_fn)
 
@@ -962,6 +960,25 @@ def main():
                             rep.missing[:3])
         LOG.info("[%s] validate: pass=%d fail=%d", step, n_pass, n_fail)
         rebuild_manifest(root)
+
+        # A GPU worker can die with a non-zero/-signal exit (commonly -11 SIGSEGV)
+        # from the CuMesh before-view renderer hitting a poison mesh — a
+        # non-recoverable CUDA-context corruption that can't be caught in Python.
+        # That render is an auxiliary artifact: the core encode (latents) is
+        # written *before* it, so the per-object validate above is the real
+        # source of truth. Only abort when validate shows actual missing output;
+        # if every object is complete, treat the crash as benign and continue.
+        if dispatch_rc != 0:
+            if n_fail == 0:
+                LOG.warning("[%s] dispatch_gpus rc=%d but validate shows all %d "
+                            "objects complete — likely a CuMesh segfault on a "
+                            "poison mesh during an auxiliary render; treating the "
+                            "step as complete and continuing.", step, dispatch_rc,
+                            n_pass)
+            else:
+                LOG.error("[%s] dispatch_gpus returned rc=%d with %d incomplete "
+                          "objects — aborting", step, dispatch_rc, n_fail)
+                exit_rc = dispatch_rc
         if exit_rc != 0:
             break
 
