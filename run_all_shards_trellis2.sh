@@ -64,12 +64,27 @@ fi
 ts() { date '+%F %T'; }
 log() { echo "[$(ts)] [driver] $*"; }
 
+# True iff a REAL shard pipeline worker is alive. We match the run-script name
+# but must exclude false positives whose cmdline merely *mentions* it:
+#   * the tmux SERVER, whose argv keeps the original
+#     `tmux new-session … bash run_pipeline_v3_shard_trellis2.sh …` and never
+#     exits (it hosts our own session — killing it would kill the driver);
+#   * the `| tee` log pipe;
+#   * grep / our own driver.
+# A genuine worker line looks like `<pid> bash run_pipeline_v3_shard_trellis2.sh
+# posthoc_shardNN …` — no tmux/tee.
+pool_busy() {
+    pgrep -af 'run_pipeline_v3_shard_trellis2\.sh' 2>/dev/null \
+        | grep -vE 'tmux|[[:space:]]tee([[:space:]]|$)|run_all_shards_trellis2|[[:space:]]grep([[:space:]]|$)' \
+        | grep -q .
+}
+
 # Block until no foreign shard pipeline is running. The driver runs its own
 # shard children synchronously, so between shards this matches only OTHER runs
 # (e.g. the manual prod00 tmux) — never our own.
 wait_for_pool_free() {
     local first=1
-    while pgrep -f 'run_pipeline_v3_shard_trellis2\.sh' >/dev/null 2>&1; do
+    while pool_busy; do
         if [ "$first" = 1 ]; then
             log "another shard pipeline is active — waiting for it to finish before starting the next shard…"
             first=0
