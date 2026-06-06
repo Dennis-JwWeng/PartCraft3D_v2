@@ -31,7 +31,8 @@ Status values:
 """
 from __future__ import annotations
 
-import fcntl
+import atexit
+import copy
 import json
 import os
 import tempfile
@@ -45,41 +46,64 @@ from .paths import ObjectContext
 
 SCHEMA_VERSION = 1
 
-_thread_mutexes: dict[str, threading.Lock] = {}
-_thread_guard = threading.Lock()
+# ─────────────────────────────────────────────────────────────────────────────
+# Write-behind cache for edit_status.json
+#
+# edit_status.json is read-modify-written on the hot path (every step / every
+# edit-stage transition), often from inside the asyncio event loop.  On the
+# networked CPFS/FUSE backing store a single fcntl.lockf + atomic-replace can
+# spike to seconds and FREEZE the whole event loop (all VLM consumers stall in
+# lockstep, GPU idles).  To decouple FS latency from the hot path:
+#
+#   * an in-process cache holds each object's latest edit_status (source of
+#     truth during the run) → reads never touch disk after the first load;
+#   * mutations update the cache under a per-object threading.Lock and mark it
+#     dirty → the hot path returns immediately;
+#   * a background daemon thread flushes dirty entries to disk (tmp + replace),
+#     coalescing repeated writes, so an FS hiccup can never block a consumer;
+#   * flush_edit_status() drains synchronously for stage-end durability and is
+#     registered atexit as a safety net.
+#
+# The cross-process fcntl.lockf is dropped: each object is owned by exactly one
+# GPU shard process (run_trellis2 --gpu-shard k/N), so its edit_status.json is
+# never written concurrently by two processes.  The per-object threading.Lock
+# gives the in-process atomicity that step (status.py) and edit writers share.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Per-object lock is REENTRANT: the read-modify-write helpers acquire it via
+# _edit_status_lock and then call load_edit_status / save_edit_status, which
+# re-acquire the same key's lock on the same thread.  A plain Lock would
+# self-deadlock there; RLock allows the nested same-thread acquisition while
+# still excluding other threads (e.g. the background writer).
+_es_locks: dict[str, "threading.RLock"] = {}
+_es_locks_guard = threading.Lock()
+_es_cache: dict[str, dict[str, Any]] = {}
+_es_dirty: set[str] = set()
+_es_cv = threading.Condition()
+_es_writer_started = False
 
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-@contextmanager
-def _edit_status_lock(ctx: ObjectContext):
-    """Per-object exclusive lock for edit_status.json read-modify-write.
-
-    Same pattern as ``status._status_lock``: fcntl.lockf (NFS-safe) +
-    per-key threading.Lock for in-process safety.
-    """
-    lock_path = ctx.dir / "edit_status.json.lock"
-    ctx.dir.mkdir(parents=True, exist_ok=True)
-    key = str(lock_path.resolve())
-    with _thread_guard:
-        if key not in _thread_mutexes:
-            _thread_mutexes[key] = threading.Lock()
-        thread_mtx = _thread_mutexes[key]
-    with thread_mtx:
-        with open(lock_path, "a") as lf:
-            fcntl.lockf(lf, fcntl.LOCK_EX)
-            yield
-
-
-# --- I/O ---
-
 def _es_path(ctx: ObjectContext) -> Path:
     return ctx.dir / "edit_status.json"
 
 
-def load_edit_status(ctx: ObjectContext) -> dict[str, Any]:
+def _es_key(ctx: ObjectContext) -> str:
+    return str(_es_path(ctx).resolve())
+
+
+def _es_lock_for(key: str) -> "threading.RLock":
+    with _es_locks_guard:
+        lk = _es_locks.get(key)
+        if lk is None:
+            lk = _es_locks[key] = threading.RLock()
+        return lk
+
+
+def _es_read_disk(ctx: ObjectContext) -> dict[str, Any]:
     p = _es_path(ctx)
     _empty: dict[str, Any] = {
         "obj_id": ctx.obj_id,
@@ -93,9 +117,7 @@ def load_edit_status(ctx: ObjectContext) -> dict[str, Any]:
             if not p.is_file():
                 return _empty
             data = json.loads(p.read_text())
-            if isinstance(data, dict):
-                return data
-            return _empty
+            return data if isinstance(data, dict) else _empty
         except json.JSONDecodeError:
             return _empty
         except OSError:
@@ -104,18 +126,118 @@ def load_edit_status(ctx: ObjectContext) -> dict[str, Any]:
     return _empty
 
 
-def save_edit_status(ctx: ObjectContext, data: dict[str, Any]) -> None:
-    data["updated"] = _now()
-    p = _es_path(ctx)
-    ctx.dir.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".es.", suffix=".tmp", dir=str(ctx.dir))
+def _es_write_disk(key: str) -> None:
+    """Flush one cached entry to disk (atomic).  Runs OFF the hot path."""
+    lk = _es_lock_for(key)
+    with lk:
+        snap = _es_cache.get(key)
+        snap = copy.deepcopy(snap) if snap is not None else None
+    if snap is None:
+        return
+    p = Path(key)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".es.", suffix=".tmp", dir=str(p.parent))
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(snap, f, ensure_ascii=False, indent=2)
         os.replace(tmp, p)
     except Exception:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+def _es_writer_loop() -> None:
+    while True:
+        with _es_cv:
+            while not _es_dirty:
+                _es_cv.wait()
+            key = _es_dirty.pop()
+        try:
+            _es_write_disk(key)
+        except Exception:
+            # Re-queue once; never let a transient FS error kill the writer.
+            with _es_cv:
+                _es_dirty.add(key)
+                _es_cv.wait(timeout=1.0)
+
+
+def _es_ensure_writer() -> None:
+    global _es_writer_started
+    if _es_writer_started:
+        return
+    with _es_locks_guard:
+        if _es_writer_started:
+            return
+        t = threading.Thread(target=_es_writer_loop, name="edit-status-writer",
+                             daemon=True)
+        t.start()
+        _es_writer_started = True
+
+
+def flush_edit_status(timeout: float = 60.0) -> None:
+    """Synchronously drain all pending edit_status writes (stage-end durability).
+
+    Writes on the calling thread so it works even at interpreter shutdown when
+    the daemon writer may already be gone.
+    """
+    import time as _t
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        with _es_cv:
+            if not _es_dirty:
+                return
+            key = _es_dirty.pop()
+        try:
+            _es_write_disk(key)
+        except Exception:
+            pass
+
+
+atexit.register(flush_edit_status)
+
+
+@contextmanager
+def _edit_status_lock(ctx: ObjectContext):
+    """Per-object in-process lock for the edit_status read-modify-write window.
+
+    Shared by step writers (status.py) and edit-stage writers so they never
+    clobber each other's slice of the same edit_status.json.  No fcntl — see
+    the module note above.
+    """
+    lk = _es_lock_for(_es_key(ctx))
+    with lk:
+        yield
+
+
+# --- I/O ---
+
+def load_edit_status(ctx: ObjectContext) -> dict[str, Any]:
+    """Return a mutable copy of the object's edit_status (cache-backed)."""
+    key = _es_key(ctx)
+    lk = _es_lock_for(key)
+    with lk:
+        data = _es_cache.get(key)
+        if data is None:
+            data = _es_read_disk(ctx)
+            _es_cache[key] = data
+        return copy.deepcopy(data)
+
+
+def save_edit_status(ctx: ObjectContext, data: dict[str, Any]) -> None:
+    """Update the in-memory cache and schedule an async disk flush.
+
+    Returns immediately — disk I/O happens on the background writer thread, so
+    a slow networked FS can never block the caller (e.g., the asyncio loop).
+    """
+    data["updated"] = _now()
+    key = _es_key(ctx)
+    lk = _es_lock_for(key)
+    with lk:
+        _es_cache[key] = copy.deepcopy(data)
+    _es_ensure_writer()
+    with _es_cv:
+        _es_dirty.add(key)
+        _es_cv.notify()
 
 
 # --- read-modify-write ---

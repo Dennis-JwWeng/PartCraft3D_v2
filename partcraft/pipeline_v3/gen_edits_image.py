@@ -565,6 +565,13 @@ async def gen_edits_streaming(
         await asyncio.gather(producer(), *consumers)
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
+        # Durability barrier: drain the write-behind edit_status cache to disk
+        # before the stage process moves on / exits (next stage reads disk cold).
+        try:
+            from .edit_status_io import flush_edit_status
+            flush_edit_status()
+        except Exception:
+            pass
 
     return results
 

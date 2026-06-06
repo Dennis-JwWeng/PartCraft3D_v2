@@ -40,40 +40,23 @@ def _load_edit_status(ctx: ObjectContext) -> dict[str, Any]:
 
 
 def _save_edit_status(ctx: ObjectContext, data: dict[str, Any]) -> None:
+    # Delegate to the canonical write-behind writer so step (`steps`) and
+    # edit (`edits`) writes share one cache + lock + async flush, and a slow
+    # networked FS never blocks the caller (e.g. the asyncio event loop).
+    from .edit_status_io import save_edit_status as _canonical_save
     data["obj_id"] = ctx.obj_id
     data["shard"] = ctx.shard
     data.setdefault("schema_version", 2)
-    data["updated"] = _now()
-    ctx.dir.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".es.", suffix=".tmp", dir=str(ctx.dir))
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, _es_path(ctx))
-    except Exception:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+    _canonical_save(ctx, data)
 
 
 @contextmanager
 def _status_lock(ctx: ObjectContext):
-    """Per-object exclusive lock for edit_status read-modify-write."""
-    import threading
-
-    lock_path = ctx.dir / "edit_status.json.lock"
-    ctx.dir.mkdir(parents=True, exist_ok=True)
-    key = str(lock_path.resolve())
-    if not hasattr(_status_lock, "_thread_mutexes"):
-        _status_lock._thread_mutexes = {}
-        _status_lock._thread_mutexes_guard = threading.Lock()
-    with _status_lock._thread_mutexes_guard:
-        if key not in _status_lock._thread_mutexes:
-            _status_lock._thread_mutexes[key] = threading.Lock()
-        thread_mtx = _status_lock._thread_mutexes[key]
-    with thread_mtx:
-        with open(lock_path, "a") as lf:
-            fcntl.lockf(lf, fcntl.LOCK_EX)
-            yield
+    """Per-object lock for edit_status read-modify-write — shared with the
+    edit-stage writers via the canonical in-process lock (no fcntl)."""
+    from .edit_status_io import _edit_status_lock
+    with _edit_status_lock(ctx):
+        yield
 
 
 def load_status(ctx: ObjectContext) -> dict[str, Any]:
