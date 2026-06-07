@@ -234,7 +234,12 @@ def iter_all_specs(ctx: ObjectContext) -> Iterator[EditSpec]:
         # the entire stage with it.  Per-edit gate_a-fail handling lives
         # in edit_status.json already; nothing else to do here.
         _ga = (es_rec.get("stages") or {}).get("gate_a") or {}
-        if _ga.get("status") == "fail":
+        # "fail": rule/vlm reject — no valid best_view downstream.
+        # "deferred": type not in the active qc.edit_types allow-list — gate_a
+        # intentionally did NOT judge it this run (knowable, backfillable). Both
+        # are out-of-scope: skip so they never reach flux/s5/gate_e or inflate
+        # check_sq1's expected count.
+        if _ga.get("status") in ("fail", "deferred"):
             continue
         # best_view now lives in the authoritative stage record
         # (stages.gate_a.verdict.vlm.best_view); fall back to the pre-migration

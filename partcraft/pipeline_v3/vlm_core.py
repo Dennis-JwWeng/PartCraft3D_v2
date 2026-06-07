@@ -3082,7 +3082,12 @@ def _gate_a_prepass(ctx, edits, parts_by_id, log):
     from .qc_rules import check_rules, count_part_pixels_in_overview, _N_VIEWS
     from .qc_io import update_edit_gate
     from .edit_status_io import update_edit_stage
-    from partcraft.edit_types import FLUX_TYPES as _FLUX_TYPES
+    from partcraft.edit_types import (FLUX_TYPES as _FLUX_TYPES,
+                                      enabled_edit_types as _enabled_edit_types)
+
+    # Active edit-type allow-list (qc.edit_types via EDIT_GEN_TYPES). gate_a only
+    # JUDGES these; every other generated type is recorded as "deferred" below.
+    _enabled = _enabled_edit_types()
 
     # Load overview BGR image (may be absent → auto-pass path)
     ov_img = None
@@ -3092,7 +3097,7 @@ def _gate_a_prepass(ctx, edits, parts_by_id, log):
         if decoded is not None:
             ov_img = decoded
 
-    n_pass = n_fail = 0
+    n_pass = n_fail = n_deferred = 0
     # Same flux_seq / del_seq counters as iter_all_specs in specs.py so gate_a
     # is written to the canonical edit_id used by s4/s5.
     flux_seq = 0
@@ -3110,6 +3115,24 @@ def _gate_a_prepass(ctx, edits, parts_by_id, log):
             continue  # identity / addition / unknown — not gated here
 
         edit_id = ctx.edit_id(et, seq)  # canonical id matching specs.py
+
+        # ── Allow-list gate ───────────────────────────────────────────
+        # This run only JUDGES edit types in qc.edit_types (enabled). Every
+        # other generated type is recorded as "deferred": explicitly NOT
+        # judged and NOT failed. This (a) keeps the state knowable — we can
+        # always tell a type has not passed gate_a regardless of whether the
+        # stage ran — and (b) lets a later run extend qc.edit_types and
+        # backfill exactly those edits (gate_a status == "deferred") via a
+        # forced gate_a re-run, no re-generation. iter_all_specs skips
+        # "deferred", so these never reach flux/s5/gate_e here — and gate_a no
+        # longer burns VLM compute on types this run discards (mirrors the
+        # iter_flux_specs allow-list that already gated flux/s5).
+        if et not in _enabled:
+            update_edit_stage(ctx, edit_id, et, "gate_a", status="deferred",
+                              reason="type_not_in_active_edit_types")
+            n_deferred += 1
+            continue
+
         prompt = edit.get("prompt", "")
         sel    = list(edit.get("selected_part_ids") or [])
 
@@ -3163,6 +3186,9 @@ def _gate_a_prepass(ctx, edits, parts_by_id, log):
 
         vlm_tasks.append((idx, edit_id, et, prompt, sel, rule_result,
                           px, column_map))
+    if n_deferred:
+        log.info("[gate_a] %s: %d edit(s) deferred (type not in active "
+                 "edit_types=%s)", ctx.obj_id, n_deferred, sorted(_enabled))
     return ov_img, vlm_tasks, n_pass, n_fail
 
 
