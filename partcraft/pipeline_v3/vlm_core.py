@@ -3063,93 +3063,40 @@ def build_text_align_gate_image(
     return buf.tobytes()
 
 
-async def _run_text_align_gate_for_object(
-    ctx,
-    vlm_url: str,
-    vlm_model: str,
-    force: bool,
-    log: "logging.Logger",
-    per_obj_concurrency: int = 0,
-) -> dict:
-    """Run gate_text_align for one object.
+def _gate_a_prepass(ctx, edits, parts_by_id, log):
+    """Synchronous gate_a pre-pass — meant to run OFF the asyncio event loop.
 
-    Reads phase1/parsed.json and overview.png, runs per-edit alignment gate,
-    writes gate_a results to edit_status.json.
+    Decodes the overview, then for every edit runs rule checks + pixel-
+    visibility counting (5 views) and writes an immediate pass/fail for edits
+    that don't need a VLM call.  Returns ``(ov_img, vlm_tasks, n_pass, n_fail)``
+    where ``vlm_tasks`` are the edits still needing the async VLM gate.
 
-    ``per_obj_concurrency`` (>0) caps how many of this object's edits may
-    have an in-flight VLM image call at once.  This prevents a single
-    object's ``asyncio.gather`` from sending 10+ concurrent multimodal
-    requests to one SGLang server (which exhausts KV cache and stalls
-    other consumers).  ``0`` (default) keeps the legacy unbounded fan-out.
+    This is pure numpy/CPU and never awaits; running it inline on the event
+    loop blocked every *other* concurrently-gated object — cross-object
+    concurrency collapsed to ~1 and the VLM GPUs idled at ~0%.  Dispatched via
+    asyncio.to_thread (numpy/cv2 release the GIL) so N objects' pre-passes
+    overlap and keep the VLM servers fed.
     """
     import cv2
     import numpy as np
     from .qc_rules import check_rules, count_part_pixels_in_overview, _N_VIEWS
-    from .status import update_step, STATUS_OK, STATUS_FAIL, STATUS_SKIP, step_done
     from .qc_io import update_edit_gate
     from .edit_status_io import update_edit_stage
-    from openai import AsyncOpenAI
-
-    if not force and step_done(ctx, "sq1_qc_A"):
-        return {"obj_id": ctx.obj_id, "skipped": True}
-
-    # If phase1 was skipped (too many parts) — nothing to gate
-    status_path = ctx.status_path
-    if status_path.is_file():
-        try:
-            import json as _json
-            _st = _json.loads(status_path.read_text())
-            if _st.get("steps", {}).get("s1_phase1", {}).get("status") == "skip":
-                update_step(ctx, "sq1_qc_A", status=STATUS_SKIP, reason="s1_skipped")
-                return {"obj_id": ctx.obj_id, "skipped": True}
-        except Exception:
-            pass
-
-    if not ctx.parsed_path.is_file():
-        update_step(ctx, "sq1_qc_A", status=STATUS_FAIL, error="missing_parsed_json")
-        return {"obj_id": ctx.obj_id, "error": "missing_parsed_json"}
-
-    try:
-        import json as _json
-        raw = _json.loads(ctx.parsed_path.read_text())
-    except Exception as exc:
-        update_step(ctx, "sq1_qc_A", status=STATUS_FAIL,
-                    error=f"corrupt_parsed_json: {exc}")
-        return {"obj_id": ctx.obj_id, "error": "corrupt_parsed_json"}
-
-    obj = (raw.get("parsed") or {}).get("object") or {}
-    parts_by_id = {
-        p["part_id"]: p
-        for p in (obj.get("parts") or [])
-        if isinstance(p, dict) and "part_id" in p
-    }
-    edits = (raw.get("parsed") or {}).get("edits") or []
+    from partcraft.edit_types import FLUX_TYPES as _FLUX_TYPES
 
     # Load overview BGR image (may be absent → auto-pass path)
-    ov_img: "np.ndarray | None" = None
+    ov_img = None
     if ctx.overview_path.is_file():
         buf = np.frombuffer(ctx.overview_path.read_bytes(), dtype=np.uint8)
         decoded = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if decoded is not None:
             ov_img = decoded
 
-    from partcraft.edit_types import FLUX_TYPES as _FLUX_TYPES
-
-    client = AsyncOpenAI(base_url=vlm_url, api_key="EMPTY")
     n_pass = n_fail = 0
-
-    # Use the same flux_seq / del_seq counters as iter_all_specs in specs.py
-    # so that gate_a is written to the canonical edit_id used by s4/s5.
+    # Same flux_seq / del_seq counters as iter_all_specs in specs.py so gate_a
+    # is written to the canonical edit_id used by s4/s5.
     flux_seq = 0
     del_seq  = 0
-
-    # Pre-pass (synchronous): run rule check + pixel-visibility for every
-    # edit; write immediate pass/fail for ones that don't need a VLM call;
-    # collect a task tuple for ones that do.  Each VLM round-trip is ~1.5s
-    # and dominates per-object wall time, so we then dispatch every
-    # eligible edit's call concurrently via asyncio.gather instead of
-    # awaiting them one by one (the original loop was strictly sequential
-    # and left the VLM servers ~15% utilized).
     vlm_tasks: list = []
     for idx, edit in enumerate(edits):
         et = edit.get("edit_type", "unknown")
@@ -3214,12 +3161,79 @@ async def _run_text_align_gate_for_object(
             n_fail += 1
             continue
 
-        # Defer the cv2 mosaic + prompt build to _judge_one; we want to
-        # run them off the event loop (asyncio.to_thread) so that pending
-        # VLM responses for *other* objects don't get starved while we
-        # compose the gate image for this one.
         vlm_tasks.append((idx, edit_id, et, prompt, sel, rule_result,
                           px, column_map))
+    return ov_img, vlm_tasks, n_pass, n_fail
+
+
+async def _run_text_align_gate_for_object(
+    ctx,
+    vlm_url: str,
+    vlm_model: str,
+    force: bool,
+    log: "logging.Logger",
+    per_obj_concurrency: int = 0,
+) -> dict:
+    """Run gate_text_align for one object.
+
+    Reads phase1/parsed.json and overview.png, runs per-edit alignment gate,
+    writes gate_a results to edit_status.json.
+
+    ``per_obj_concurrency`` (>0) caps how many of this object's edits may
+    have an in-flight VLM image call at once.  This prevents a single
+    object's ``asyncio.gather`` from sending 10+ concurrent multimodal
+    requests to one SGLang server (which exhausts KV cache and stalls
+    other consumers).  ``0`` (default) keeps the legacy unbounded fan-out.
+    """
+    import cv2
+    import numpy as np
+    from .qc_rules import check_rules, count_part_pixels_in_overview, _N_VIEWS
+    from .status import update_step, STATUS_OK, STATUS_FAIL, STATUS_SKIP, step_done
+    from .qc_io import update_edit_gate
+    from .edit_status_io import update_edit_stage
+    from openai import AsyncOpenAI
+
+    if not force and step_done(ctx, "sq1_qc_A"):
+        return {"obj_id": ctx.obj_id, "skipped": True}
+
+    # If phase1 was skipped (too many parts) — nothing to gate
+    status_path = ctx.status_path
+    if status_path.is_file():
+        try:
+            import json as _json
+            _st = _json.loads(status_path.read_text())
+            if _st.get("steps", {}).get("s1_phase1", {}).get("status") == "skip":
+                update_step(ctx, "sq1_qc_A", status=STATUS_SKIP, reason="s1_skipped")
+                return {"obj_id": ctx.obj_id, "skipped": True}
+        except Exception:
+            pass
+
+    if not ctx.parsed_path.is_file():
+        update_step(ctx, "sq1_qc_A", status=STATUS_FAIL, error="missing_parsed_json")
+        return {"obj_id": ctx.obj_id, "error": "missing_parsed_json"}
+
+    try:
+        import json as _json
+        raw = _json.loads(ctx.parsed_path.read_text())
+    except Exception as exc:
+        update_step(ctx, "sq1_qc_A", status=STATUS_FAIL,
+                    error=f"corrupt_parsed_json: {exc}")
+        return {"obj_id": ctx.obj_id, "error": "corrupt_parsed_json"}
+
+    obj = (raw.get("parsed") or {}).get("object") or {}
+    parts_by_id = {
+        p["part_id"]: p
+        for p in (obj.get("parts") or [])
+        if isinstance(p, dict) and "part_id" in p
+    }
+    edits = (raw.get("parsed") or {}).get("edits") or []
+
+    # Run the synchronous rule/pixel pre-pass off the event loop so that
+    # concurrently-gated objects don't block one another (see _gate_a_prepass).
+    # Only the async VLM gate (_judge_one) stays inline on the loop.
+    client = AsyncOpenAI(base_url=vlm_url, api_key="EMPTY")
+    ov_img, vlm_tasks, n_pass, n_fail = await _asyncio.to_thread(
+        _gate_a_prepass, ctx, edits, parts_by_id, log)
 
     # ── Layer 3: parallel VLM alignment gate ──────────────────────────
     async def _judge_one(task: tuple) -> bool:
