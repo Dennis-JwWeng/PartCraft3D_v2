@@ -27,9 +27,12 @@ FLUX worker untouched.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator
+
+_LOG = logging.getLogger(__name__)
 
 from .paths import EDIT_TYPE_PREFIX, FLUX_TYPES, ObjectContext
 from .vlm_core import VIEW_INDICES  # single source of truth; defined in vlm_core.py
@@ -230,16 +233,29 @@ def iter_all_specs(ctx: ObjectContext) -> Iterator[EditSpec]:
         # would (correctly) refuse to fabricate a view and raise — taking
         # the entire stage with it.  Per-edit gate_a-fail handling lives
         # in edit_status.json already; nothing else to do here.
-        if (es_rec.get("stages") or {}).get("gate_a", {}).get("status") == "fail":
+        _ga = (es_rec.get("stages") or {}).get("gate_a") or {}
+        if _ga.get("status") == "fail":
             continue
         # best_view now lives in the authoritative stage record
         # (stages.gate_a.verdict.vlm.best_view); fall back to the pre-migration
         # top-level gates.A for un-migrated edit_status.json files.
-        _ga = (es_rec.get("stages") or {}).get("gate_a") or {}
         bv = ((_ga.get("verdict") or {}).get("vlm") or {}).get("best_view")
         if bv is None:
             bv = ((es_rec.get("gates") or {}).get("A", {})
                   .get("vlm", {}).get("best_view"))
+        if bv is None:
+            # gate_a is marked pass but its verdict (and best_view) is missing.
+            # This is a legacy artifact of the pre-merge-in-place clobber bug
+            # (a status-only update_edit_stage wiped the verdict), or a
+            # status-only write. We cannot fabricate a view, so skip this edit
+            # rather than let from_parsed_edit raise and take the whole stage
+            # (and shard) down. Re-running gate_a for the object repopulates
+            # the verdict; until then this edit is simply not generated.
+            _LOG.warning(
+                "[iter_all_specs] %s edit %s: gate_a pass but best_view "
+                "missing — skipping (re-run gate_a to repopulate)",
+                ctx.obj_id, edit_id)
+            continue
         yield EditSpec.from_parsed_edit(
             ctx, idx, e, seq, parts_by_id,
             object_desc, object_desc_s1, object_desc_s2,
