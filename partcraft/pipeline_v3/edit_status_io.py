@@ -136,6 +136,25 @@ def _es_write_disk(key: str) -> None:
         return
     p = Path(key)
     p.parent.mkdir(parents=True, exist_ok=True)
+    # Preserve qc_io-owned per-edit fields. qc_io writes gates/final_pass
+    # straight to disk, bypassing this module's _es_cache; the cache is seeded
+    # once and never re-reads disk, so flushing our snapshot would otherwise
+    # clobber a best_view/gate written out-of-band after the seed. Re-read disk
+    # and graft those fields back. Disk is always >= cache in freshness for
+    # these keys (we never write them), so preferring disk is safe. A transient
+    # CPFS read error just degrades to the old (clobber-prone) behaviour.
+    try:
+        _disk = json.loads(p.read_text()) if p.is_file() else {}
+    except (OSError, json.JSONDecodeError):
+        _disk = {}
+    _disk_edits = _disk.get("edits", {}) if isinstance(_disk, dict) else {}
+    for _eid, _entry in (snap.get("edits", {}) or {}).items():
+        _de = _disk_edits.get(_eid)
+        if not isinstance(_de, dict):
+            continue
+        for _k in ("gates", "final_pass"):
+            if _k in _de:
+                _entry[_k] = _de[_k]
     fd, tmp = tempfile.mkstemp(prefix=".es.", suffix=".tmp", dir=str(p.parent))
     try:
         with os.fdopen(fd, "w") as f:
