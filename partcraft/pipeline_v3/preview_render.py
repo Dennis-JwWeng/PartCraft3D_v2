@@ -111,9 +111,16 @@ def _best_view_slot_for_edit(
     def _pick(eid: str) -> int | None:
         es = load_edit_status(ctx)
         e = (es.get("edits") or {}).get(eid) or {}
-        ga = (e.get("gates") or {}).get("A")
-        vlm = ga.get("vlm") if isinstance(ga, dict) else None
+        # best_view from the authoritative stage record; fall back to the
+        # pre-migration top-level gates.A for un-migrated files.
+        ga_stage = (e.get("stages") or {}).get("gate_a") or {}
+        verdict = ga_stage.get("verdict") if isinstance(ga_stage, dict) else None
+        vlm = verdict.get("vlm") if isinstance(verdict, dict) else None
         bv = vlm.get("best_view") if isinstance(vlm, dict) else None
+        if bv is None:
+            ga = (e.get("gates") or {}).get("A")
+            lvlm = ga.get("vlm") if isinstance(ga, dict) else None
+            bv = lvlm.get("best_view") if isinstance(lvlm, dict) else None
         if isinstance(bv, int) and 0 <= bv < len(VIEW_INDICES):
             return int(bv)
         return None

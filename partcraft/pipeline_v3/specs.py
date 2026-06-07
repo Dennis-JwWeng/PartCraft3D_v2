@@ -232,8 +232,14 @@ def iter_all_specs(ctx: ObjectContext) -> Iterator[EditSpec]:
         # in edit_status.json already; nothing else to do here.
         if (es_rec.get("stages") or {}).get("gate_a", {}).get("status") == "fail":
             continue
-        bv = ((es_rec.get("gates") or {}).get("A", {})
-              .get("vlm", {}).get("best_view"))
+        # best_view now lives in the authoritative stage record
+        # (stages.gate_a.verdict.vlm.best_view); fall back to the pre-migration
+        # top-level gates.A for un-migrated edit_status.json files.
+        _ga = (es_rec.get("stages") or {}).get("gate_a") or {}
+        bv = ((_ga.get("verdict") or {}).get("vlm") or {}).get("best_view")
+        if bv is None:
+            bv = ((es_rec.get("gates") or {}).get("A", {})
+                  .get("vlm", {}).get("best_view"))
         yield EditSpec.from_parsed_edit(
             ctx, idx, e, seq, parts_by_id,
             object_desc, object_desc_s1, object_desc_s2,

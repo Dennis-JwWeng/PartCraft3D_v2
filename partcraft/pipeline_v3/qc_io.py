@@ -135,32 +135,46 @@ def _sync_fail_fields(entry: dict[str, Any]) -> None:
 
 
 def _build_qc_view_from_es(ctx: ObjectContext, es: dict[str, Any]) -> dict[str, Any]:
+    """Reconstruct the legacy {gates:{A,C,E}, final_pass} view from the
+    authoritative per-edit ``stages`` record.
+
+    Gate payloads now live at ``stages.<gate>.verdict``. We source from there,
+    fall back to ``stages.<gate>.status`` when only a status was written, and
+    finally to a pre-migration top-level ``gates`` map for un-migrated files.
+    ``final_pass``/``fail_gate``/``fail_reason`` are DERIVED here (read-time),
+    keeping the same lenient _gp semantics readers relied on before.
+    """
     edits_out: dict[str, Any] = {}
     for edit_id, e in (es.get("edits") or {}).items():
         if not isinstance(e, dict):
             continue
-        gates = dict((e.get("gates") or {}))
-        gates.setdefault("A", None)
-        gates.setdefault("C", None)
-        gates.setdefault("E", None)
-
-        # Backfill from stage statuses when explicit gate payloads are missing.
         stages = e.get("stages") or {}
+        legacy = e.get("gates") or {}  # only present on un-migrated files
+        gates: dict[str, Any] = {}
         for k, g in (("gate_a", "A"), ("gate_c", "C"), ("gate_e", "E")):
-            if gates.get(g) is None and k in stages:
-                st = (stages.get(k) or {}).get("status")
-                if st in ("pass", "fail"):
-                    gates[g] = {"vlm": {"pass": st == "pass", "reason": "from_stage_status"}}
+            st = stages.get(k)
+            st = st if isinstance(st, dict) else None
+            if st and st.get("verdict"):
+                gates[g] = st["verdict"]
+            elif st and st.get("status") in ("pass", "fail"):
+                gates[g] = {"vlm": {"pass": st["status"] == "pass",
+                                    "reason": "from_stage_status"}}
+            elif legacy.get(g) is not None:
+                gates[g] = legacy[g]
+            else:
+                gates[g] = None
 
+        view_entry: dict[str, Any] = {"edit_type": e.get("edit_type", ""), "gates": gates}
+        _sync_fail_fields(view_entry)  # derive final_pass + fail_gate/fail_reason
         out = {
-            "edit_type": e.get("edit_type", ""),
+            "edit_type": view_entry["edit_type"],
             "gates": gates,
-            "final_pass": bool(e.get("final_pass", True)),
+            "final_pass": view_entry["final_pass"],
         }
-        if "fail_gate" in e:
-            out["fail_gate"] = e.get("fail_gate")
-        if "fail_reason" in e:
-            out["fail_reason"] = e.get("fail_reason")
+        if "fail_gate" in view_entry:
+            out["fail_gate"] = view_entry["fail_gate"]
+        if "fail_reason" in view_entry:
+            out["fail_reason"] = view_entry["fail_reason"]
         edits_out[edit_id] = out
 
     return {
@@ -172,7 +186,10 @@ def _build_qc_view_from_es(ctx: ObjectContext, es: dict[str, Any]) -> dict[str, 
 
 
 def load_qc(ctx: ObjectContext) -> dict[str, Any]:
-    es = _load_es(ctx)
+    # Read through the canonical cache so we see in-process writes (gate
+    # verdicts now go through edit_status_io, not qc_io's own disk path).
+    from .edit_status_io import load_edit_status
+    es = load_edit_status(ctx)
     return _build_qc_view_from_es(ctx, es)
 
 
@@ -193,6 +210,9 @@ def save_qc(ctx: ObjectContext, qc: dict[str, Any]) -> None:
         _save_es(ctx, es)
 
 
+_GATE_TO_STAGE = {"A": "gate_a", "C": "gate_c", "E": "gate_e"}
+
+
 def update_edit_gate(
     ctx: ObjectContext,
     edit_id: str,
@@ -202,24 +222,25 @@ def update_edit_gate(
     rule_result: dict | None = None,
     vlm_result: dict | None = None,
 ) -> None:
-    with _es_lock(ctx):
-        es = _load_es(ctx)
-        entry = es.setdefault("edits", {}).setdefault(edit_id, {
-            "edit_type": edit_type,
-            "stages": {},
-            "gates": {"A": None, "C": None, "E": None},
-            "final_pass": False,
-        })
-        entry["edit_type"] = edit_type
-        gates = entry.setdefault("gates", {"A": None, "C": None, "E": None})
-        gd: dict[str, Any] = {}
-        if rule_result is not None:
-            gd["rule"] = rule_result
-        if vlm_result is not None:
-            gd["vlm"] = vlm_result
-        gates[gate] = gd if gd else None
-        _sync_fail_fields(entry)
-        _save_es(ctx, es)
+    """Persist a gate verdict into the single authoritative per-edit record.
+
+    The verdict (rule/vlm payload incl. best_view) and its pass/fail status go
+    to ``stages.<gate>`` via edit_status_io — the SAME cache + lock as s4/s5 —
+    not a separate top-level ``gates`` map written out-of-band. That removes the
+    second writer that raced the stage writer and silently wiped best_view.
+    ``load_qc`` reconstructs the legacy {gates, final_pass} view for readers.
+    """
+    from .edit_status_io import update_edit_stage
+    gd: dict[str, Any] = {}
+    if rule_result is not None:
+        gd["rule"] = rule_result
+    if vlm_result is not None:
+        gd["vlm"] = vlm_result
+    verdict = gd if gd else None
+    status = "pass" if _gp(verdict) else "fail"
+    stage_key = _GATE_TO_STAGE.get(gate, gate)
+    update_edit_stage(ctx, edit_id, edit_type, stage_key,
+                      status=status, verdict=verdict)
 
 
 def is_edit_qc_failed(ctx: ObjectContext, edit_id: str) -> bool:

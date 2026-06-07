@@ -269,10 +269,18 @@ def update_edit_stage(
     *,
     status: str,
     reason: str | None = None,
+    verdict: dict[str, Any] | None = None,
 ) -> None:
     """Atomically set the status for one stage of one edit.
 
-    Process-safe via lockf + threading.Lock.
+    Merges IN PLACE into the existing stage entry rather than replacing it, so
+    fields written by a different call survive. In particular a gate's
+    ``verdict`` (best_view, rule/vlm payload — written by qc_io.update_edit_gate
+    via this same function) is not clobbered by a later bare status write, and
+    vice-versa. This is the single authoritative per-(edit, stage) record:
+    ``stages.<stage> = {status, ts, reason?, verdict?}``.
+
+    Process-safe via the shared per-object lock + write-behind cache.
     """
     with _edit_status_lock(ctx):
         es = load_edit_status(ctx)
@@ -280,10 +288,13 @@ def update_edit_stage(
             "edit_type": edit_type,
             "stages": {},
         })
-        stage_entry: dict[str, Any] = {"status": status, "ts": _now()}
+        stage_entry = edit_entry.setdefault("stages", {}).setdefault(stage_key, {})
+        stage_entry["status"] = status
+        stage_entry["ts"] = _now()
         if reason is not None:
             stage_entry["reason"] = reason
-        edit_entry.setdefault("stages", {})[stage_key] = stage_entry
+        if verdict is not None:
+            stage_entry["verdict"] = verdict
         save_edit_status(ctx, es)
 
 
