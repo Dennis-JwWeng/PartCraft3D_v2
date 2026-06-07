@@ -35,7 +35,7 @@ sys.path.insert(0, str(_ROOT))
 from .paths import ObjectContext
 from . import services_cfg as psvc
 from .specs import EditSpec, iter_flux_specs
-from .status import update_step, STATUS_OK, STATUS_FAIL
+from .status import update_step, STATUS_OK, STATUS_FAIL, STATUS_SKIP
 from .qc_io import is_gate_a_failed
 from .edit_status_io import edit_needs_step, update_edit_stage, obj_needs_stage
 
@@ -978,11 +978,31 @@ def run(
         ):
             results.append(Trellis2Result(ctx.obj_id))
             continue
-        results.append(run_for_object(
-            ctx, pipeline=pipeline, dataset=dataset, p25_cfg=p25_cfg,
-            seed=seed, debug=debug,
-            prereq_map=prereq_map, force=force, logger=log,
-        ))
+        # Per-object guard: a single bad object (e.g. missing P1 encode
+        # output from a segfaulted encode worker — FileNotFoundError in
+        # _load_p1_slat) must NOT propagate to main() and kill this GPU
+        # worker, which would abandon the rest of its 1/N object slice.
+        # Record the failure and continue to the next object.
+        try:
+            results.append(run_for_object(
+                ctx, pipeline=pipeline, dataset=dataset, p25_cfg=p25_cfg,
+                seed=seed, debug=debug,
+                prereq_map=prereq_map, force=force, logger=log,
+            ))
+        except FileNotFoundError as exc:
+            # Missing prerequisite (P1 encode) — object is unprocessable as-is;
+            # mark skip so resume/validate can account for it and move on.
+            log.error("[s5] %s skipped — missing prerequisite: %s",
+                      ctx.obj_id, exc)
+            update_step(ctx, "s5_trellis2", status=STATUS_SKIP,
+                        reason=f"missing_prereq: {exc}")
+            results.append(Trellis2Result(ctx.obj_id, error=str(exc)))
+        except Exception as exc:  # noqa: BLE001 — never let one object kill the worker
+            log.exception("[s5] %s failed with unhandled error: %s",
+                          ctx.obj_id, exc)
+            update_step(ctx, "s5_trellis2", status=STATUS_FAIL,
+                        error=str(exc))
+            results.append(Trellis2Result(ctx.obj_id, error=str(exc)))
     return results
 
 
