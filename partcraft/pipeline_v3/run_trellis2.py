@@ -684,6 +684,70 @@ def dispatch_gpus(
     return rc
 
 
+def _backfill_missing_encode(
+    ctxs: list[ObjectContext],
+    args: argparse.Namespace,
+    log,
+    rounds: int = 2,
+) -> int:
+    """Ensure every object s5 will process has its P1 encode before s5 runs.
+
+    A CuMesh CUDA error in the encode-time auxiliary render corrupts the
+    worker's CUDA context and hard-crashes the process (rc=-11), leaving the
+    *trailing* objects in that worker with no ``p1_encode/shape_slat.npz`` and
+    no status — silently dropped (the encode step has no file validator, so the
+    post-step validate rubber-stamps them ``ok``).  Here, at the s5 prerequisite
+    boundary (Gate A is decided, so we know exactly which objects s5 consumes),
+    re-encode just those casualties in a FRESH process (clean CUDA context).
+
+    The poison object itself keeps its encode — the core latents are saved
+    *before* the fragile render — so it is never in this set and is never
+    re-rendered: no re-crash.  Bounded ``rounds`` in case a casualty is itself a
+    poison mesh; residual misses are left for s5's per-object guard to skip.
+    """
+    by_id = {c.obj_id: c for c in ctxs}
+
+    def _still_missing(ids: list[str]) -> list[str]:
+        out = []
+        for oid in ids:
+            c = by_id[oid]
+            need = any(not is_gate_a_failed(c, sp.edit_id)
+                       for sp in iter_flux_specs(c))
+            if need and not (c.dir / "p1_encode" / "shape_slat.npz").is_file():
+                out.append(oid)
+        return out
+
+    missing = _still_missing([c.obj_id for c in ctxs])
+    if not missing:
+        return 0
+    log.warning("[s5/pre] %d object(s) consumed by s5 lack p1_encode/shape_slat.npz "
+                "(CuMesh-segfault casualties) — targeted re-encode before s5: %s%s",
+                len(missing), missing[:5], " …" if len(missing) > 5 else "")
+    import copy as _copy
+    for rnd in range(1, rounds + 1):
+        sub = _copy.copy(args)
+        sub.obj_ids = list(missing)
+        sub.obj_ids_file = None
+        sub.all = False
+        sub.force = False
+        sub.single_gpu = False
+        sub.gpu_shard = None
+        sub.skip_input_check = True
+        sub.steps = "trellis2_encode"
+        rc = dispatch_gpus("trellis2_encode", args.config, sub)
+        still = _still_missing(missing)
+        log.info("[s5/pre] re-encode round %d/%d: rc=%d recovered=%d still-missing=%d",
+                 rnd, rounds, rc, len(missing) - len(still), len(still))
+        missing = still
+        if not missing:
+            break
+    if missing:
+        log.error("[s5/pre] %d object(s) STILL missing encode after %d round(s) — "
+                  "s5 will skip them (likely genuine poison meshes): %s",
+                  len(missing), rounds, missing[:10])
+    return len(missing)
+
+
 def run_single_gpu(
     step: str,
     cfg_path: Path,
@@ -941,6 +1005,11 @@ def main():
                           and args.gpus
                           and (phase_use_gpus or not run_stage)
                           and not args.single_gpu)
+        # Before s5: backfill any P1 encode silently dropped by a CuMesh
+        # segfault in the encode stage, so s5 doesn't quietly skip those
+        # objects (targeted re-encode in a fresh process — not a full rerun).
+        if step == "trellis2_3d" and wants_dispatch:
+            _backfill_missing_encode(ctxs, args, LOG)
         dispatch_rc = 0
         if wants_dispatch:
             dispatch_rc = dispatch_gpus(step, args.config, args)
