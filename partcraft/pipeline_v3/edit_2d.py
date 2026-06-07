@@ -407,8 +407,6 @@ def process_one(spec: EditSpec, dataset, client, output_dir: Path,
             result["status"] = "failed"
             result["reason"] = "VLM returned no image"
             logger.warning(f"  {edit_id}: VLM returned no image")
-
-        obj.close()
     except Exception as e:
         result["status"] = "failed"
         result["reason"] = str(e)
