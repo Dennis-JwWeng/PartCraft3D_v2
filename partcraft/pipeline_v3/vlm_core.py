@@ -3233,13 +3233,6 @@ async def _run_text_align_gate_for_object(
             gate_img = await _asyncio.to_thread(
                 build_text_align_gate_image, ov_img, sel, column_map
             )
-            # stage debug viz: the gate-A highlight image the VLM actually sees
-            try:
-                _dbg = Path(ctx.dir) / "debug" / "gate_a"
-                _dbg.mkdir(parents=True, exist_ok=True)
-                (_dbg / f"{edit_id}.png").write_bytes(gate_img)
-            except Exception:
-                pass
             gate_user = build_text_align_gate_prompt(et, prompt, sel)
             gate_raw = await call_vlm_image_async(
                 client, gate_img,
