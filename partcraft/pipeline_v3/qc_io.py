@@ -9,6 +9,7 @@ import fcntl
 import json
 import os
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -43,14 +44,7 @@ def _es_lock(ctx: ObjectContext):
 
 def _load_es(ctx: ObjectContext) -> dict[str, Any]:
     p = ctx.dir / "edit_status.json"
-    if p.is_file():
-        try:
-            data = json.loads(p.read_text())
-            if isinstance(data, dict):
-                return data
-        except json.JSONDecodeError:
-            pass
-    return {
+    default = {
         "obj_id": ctx.obj_id,
         "shard": ctx.shard,
         "schema_version": 2,
@@ -58,6 +52,25 @@ def _load_es(ctx: ObjectContext) -> dict[str, Any]:
         "edits": {},
         "steps": {},
     }
+    # /mnt is a networked CPFS mount: is_file()/read_text() can transiently
+    # raise OSError [Errno 116] Stale file handle. Retry before giving up —
+    # previously only JSONDecodeError was caught, so a single ESTALE killed
+    # the whole shard (cf. edit_status_io._es_read_disk). On a *persistent*
+    # OSError we re-raise rather than return the default, because callers
+    # load-modify-save and a default load would clobber real gate data.
+    for attempt in range(5):
+        try:
+            if not p.is_file():
+                return default
+            data = json.loads(p.read_text())
+            return data if isinstance(data, dict) else default
+        except json.JSONDecodeError:
+            return default
+        except OSError:
+            if attempt == 4:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+    return default
 
 
 def _save_es(ctx: ObjectContext, es: dict[str, Any]) -> None:
@@ -66,14 +79,23 @@ def _save_es(ctx: ObjectContext, es: dict[str, Any]) -> None:
     es.setdefault("schema_version", 2)
     es["updated"] = _now()
     ctx.dir.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".es.", suffix=".tmp", dir=str(ctx.dir))
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(es, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, ctx.dir / "edit_status.json")
-    except Exception:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+    target = ctx.dir / "edit_status.json"
+    # Atomic write, retried against transient CPFS ESTALE (see _load_es).
+    for attempt in range(5):
+        fd, tmp = tempfile.mkstemp(prefix=".es.", suffix=".tmp", dir=str(ctx.dir))
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(es, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, target)
+            return
+        except OSError:
+            Path(tmp).unlink(missing_ok=True)
+            if attempt == 4:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+        except Exception:
+            Path(tmp).unlink(missing_ok=True)
+            raise
 
 
 def _gp(gd: dict | None) -> bool:
