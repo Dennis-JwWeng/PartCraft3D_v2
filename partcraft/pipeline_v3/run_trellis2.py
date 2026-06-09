@@ -1,41 +1,33 @@
-"""Pipeline v3 orchestrator + CLI — Mode E (text-driven part editing).
+"""Pipeline v3 orchestrator + CLI — TRELLIS.2 masked 3D part-editing.
 
-Mode E uses raw text captions + part lists as the sole input; no image
-encoding is required at the prompt-generation stage.  The decided pipeline
-for Mode E is::
+The production pipeline (per shard) is::
 
-    gen_edits → gate_text_align → del_mesh → preview_del → gate_quality
+    trellis2_encode → gen_edits → gate_text_align → flux_2d → trellis2_3d → gate_quality
 
-Typical invocation::
+Typical invocation (normally driven by run_pipeline_v3_shard_trellis2.sh,
+which manages the per-stage VLM/FLUX server pools)::
 
-    python -m partcraft.pipeline_v3.run \\
-        --config configs/pipeline_v3_shard08_test.yaml \\
-        --shard 08 \\
-        --steps gen_edits,gate_text_align,del_mesh,preview_del,gate_quality \\
-        --all
+    python -m partcraft.pipeline_v3.run_trellis2 --stage trellis2_3d \\
+        --config configs/pipeline_v3_trellis2_t1ss_native_r512_pad4_posthoc_no2dqc.yaml \\
+        --shard 08 --all
 
-Active steps (decided for Mode E):
+Active steps:
 
-    gen_edits        VLM generates edit instructions from text captions + part list.
-                     Single process, multi-VLM-server fan-out.
-    gate_text_align  Gate A: VLM checks that each instruction is unambiguous and
-                     the target part is identifiable in the overview image.
-                     Runs immediately after gen_edits (post_object_fn hook).
-    del_mesh         CPU-only: KD-tree face-centroid masking on normalized GLB
-                     → produces edits_3d/<edit_id>/after_new.glb for deletion edits.
-    preview_del      Blender renders 5-view preview_{0..4}.png from after_new.glb.
-                     These are consumed by gate_quality.
-    gate_quality     Gate E: VLM compares before (image_npz) vs after (preview_del)
-                     as a 2×5 collage and scores visual_quality / correct_region /
-                     preserve_other.
+    trellis2_encode  TRELLIS.2 P1 encode: original mesh → p1_encode/shape_slat.npz
+                     (+ tex/ss + e512 sidecar) and the PBR-RGB + o-voxel-seg gate-A
+                     overview.png.
+    gen_edits        VLM generates edit instructions from the overview (Mode A).
+    gate_text_align  Gate A: VLM checks each instruction targets the right part in
+                     the overview image; non-active edit_types recorded "deferred".
+    flux_2d          FLUX 2D image edit for the active edit types (qc.edit_types).
+    trellis2_3d      TRELLIS.2 masked latent edit at 512 → edits_3d/<id> latents +
+                     gate_views/before + after named views.
+    gate_quality     Gate E: VLM scores the before/after collage per edit.
 
-Commented-out steps (not yet decided for Mode E, kept for reference):
+Deferred (deletion / addition — enabled via qc.edit_types + a gate_a/flux backfill):
 
-    flux_2d          FLUX 2D image edit for mod/scl/mat/glb edits.
-    trellis_3d       Trellis 3D latent edit (GPU).  Requires flux_2d output.
-    preview_flux     5-view preview decoded from Trellis after.npz (GPU).
-    render_3d        Full 40-view 3D render (GPU).
-    reencode_del     GPU re-encode: Blender 40-view → DINOv2 → SLAT → after.npz.
+    del_mesh         CPU: drop the selected part from the mesh → after_new.glb.
+    preview_del      Blender 5-view preview of after_new.glb for Gate E.
 
 Orchestration:
 * loads YAML config + CLI overrides;
@@ -85,10 +77,7 @@ ALL_STEPS = (
     "flux_2d",         # Step 4:  FLUX 2D image edit → edits_2d/_edited.png
     "gate_2d",         # Gate C:  VLM judges the 2D before/after vs prompt
     "trellis2_encode", # Step 4b: TRELLIS.2 P1 encode → p1_encode/shape_slat.npz (GPU)
-    "trellis_3d",      # Step 5:  Trellis 3D latent edit → after.npz  (GPU)
     "trellis2_3d",     # Step 5:  TRELLIS.2 image-driven regen → after.glb (GPU)
-    "preview_flux",    # Step 6p: Trellis-decoded 5-view preview        (GPU)
-    "render_3d",       # Step 6:  Full 40-view 3D render (optional)     (GPU)
     # ── Final quality gate (all types) ───────────────────────────────
     "gate_quality",    # Gate E:  final VLM visual quality check
     # ── Inactive ─────────────────────────────────────────────────────
@@ -98,7 +87,7 @@ ALL_STEPS = (
 # Steps that require multi-GPU subprocess dispatch via dispatch_gpus().
 # preview_del uses Blender (CPU-bound per call, parallelised by n_workers)
 # so it is NOT in GPU_STEPS.
-GPU_STEPS: frozenset[str] = frozenset({"trellis_3d", "trellis2_3d", "trellis2_encode", "preview_flux", "render_3d"})
+GPU_STEPS: frozenset[str] = frozenset({"trellis2_3d", "trellis2_encode"})
 
 
 # ─────────────────── config + ctx resolution ─────────────────────────
@@ -220,7 +209,7 @@ def _gpu_shard_ctxs(
     shard_n: int,
     slice_steps: list[str] | None,
 ) -> list[ObjectContext]:
-    """Apply ``--gpu-shard``: round-robin, or LPT when running ``trellis_3d``.
+    """Apply ``--gpu-shard``: round-robin, or LPT when running ``trellis2_3d``.
 
     Env ``TRELLIS_SHARD_MODE=roundrobin`` restores legacy index-based slicing.
 
@@ -232,7 +221,7 @@ def _gpu_shard_ctxs(
     mode = os.environ.get("TRELLIS_SHARD_MODE", "lpt").strip().lower()
     use_lpt = (
         slice_steps
-        and ("trellis_3d" in slice_steps or "trellis2_3d" in slice_steps)
+        and ("trellis2_3d" in slice_steps)
         and mode not in ("roundrobin", "rr", "0")
     )
     if use_lpt:
@@ -538,15 +527,6 @@ def run_step(
                                 vlm_model=psvc.vlm_model_name(cfg),
                                 cfg=cfg, force=args.force, concurrency=_g2c))
 
-    # ── trellis_3d ───────────────────────────────────────────────────────
-    # Trellis 3D latent edit (GPU). Consumes the FLUX-edited 2D image and
-    # the original mesh.npz SLAT to produce edits_3d/<edit_id>/after.npz.
-    # Multi-GPU via dispatch_gpus(). Requires gate_a == pass.
-    elif step == "trellis_3d":
-        from .trellis_3d import run as s5_run
-        s5_run(ctxs, cfg=cfg, images_root=images_root, mesh_root=mesh_root,
-               shard=shard, prereq_map=prereq_map, force=args.force, logger=log)
-
     # ── trellis2_encode ──────────────────────────────────────────────────
     # P1: encode original mesh → shape SLat reference, written under
     # objects/<shard>/<obj_id>/p1_encode/shape_slat.npz.  Consumed by
@@ -565,28 +545,6 @@ def run_step(
         from .trellis2_3d import run as s5v2_run
         s5v2_run(ctxs, cfg=cfg, images_root=images_root, mesh_root=mesh_root,
                  shard=shard, prereq_map=prereq_map, force=args.force, logger=log)
-
-    # ── preview_flux ─────────────────────────────────────────────────────
-    # Decode Trellis after.npz and render 5 views (GPU).
-    # Output: edits_3d/<edit_id>/preview_{0..4}.png for flux edits.
-    # Consumed by gate_quality as the "after" collage row.
-    elif step == "preview_flux":
-        from .preview_render import render_flux_previews_batch as s6p_flux_run
-        ckpt = psvc.image_edit_service(cfg).get(
-            "trellis_text_ckpt", "checkpoints/TRELLIS-text-xlarge")
-        s6p_flux_run(ctxs, ckpt=ckpt, prereq_map=prereq_map,
-                     force=args.force, logger=log)
-
-    # ── render_3d ────────────────────────────────────────────────────────
-    # Full 40-view 3D render (GPU) for final report generation.
-    # Requires gate_e == pass. Optional for Mode E; can be omitted if
-    # only the 5-view preview is needed.
-    elif step == "render_3d":
-        from .render_3d import run as s6_run
-        ckpt = psvc.image_edit_service(cfg).get(
-            "trellis_text_ckpt", "checkpoints/TRELLIS-text-xlarge")
-        s6_run(ctxs, ckpt=ckpt, prereq_map=prereq_map,
-               force=args.force, logger=log)
 
     # ── reencode_del (inactive) ───────────────────────────────────────────
     # GPU re-encode for deletion edits: Blender 40-view → DINOv2 →
@@ -614,7 +572,7 @@ def dispatch_gpus(
     per-GPU worker count for this step.
 
     K is read from ``services.image_edit.trellis_workers_per_gpu`` (env
-    override ``TRELLIS_WORKERS_PER_GPU``). Only ``trellis_3d`` honors
+    override ``TRELLIS_WORKERS_PER_GPU``). Only ``trellis2_3d`` honors
     K > 1 — the other GPU steps (``preview_flux``, ``render_3d``) keep
     K = 1 because they are compute-bound, not I/O-bound.
 
@@ -628,7 +586,7 @@ def dispatch_gpus(
         return run_single_gpu(step, cfg_path, args)
 
     k = 1
-    if step in ("trellis_3d", "trellis2_3d"):
+    if step == "trellis2_3d":
         cfg = load_config(cfg_path)
         k = psvc.trellis_workers_per_gpu(cfg)
 
@@ -1073,10 +1031,7 @@ _STATUS_KEYS: dict[str, str] = {
     "flux_2d":         "s4_flux_2d",
     "gate_2d":         "sq2_qc_C",
     "trellis2_encode": "s4b_t2_encode",
-    "trellis_3d":      "s5_trellis",
     "trellis2_3d":     "s5_trellis2",
-    "preview_flux":    "s6p_flux",
-    "render_3d":       "s6_render_3d",
     # Inactive
     # "reencode_del":  "s6b_del_reencode",
 }

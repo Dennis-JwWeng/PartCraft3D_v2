@@ -398,7 +398,7 @@ def build_prereq_map(cfg: dict) -> dict[str, str | None]:
       * ``del_mesh`` and ``preview_del`` require gate_a (text-align gate).
       * ``gate_quality`` (Gate E) has no hard file prerequisite here;
         it is gated implicitly by the presence of preview_{0..4}.png.
-      * Inactive steps (flux_2d, trellis_3d, etc.) are commented out.
+      * Inactive steps (e.g. gate_2d when Gate C is off) are commented out.
 
     The ``active`` set is derived from ``pipeline.stages[].steps`` in the
     YAML config, so enabling a QC gate in config automatically wires it as
@@ -432,8 +432,7 @@ def build_prereq_map(cfg: dict) -> dict[str, str | None]:
         "s5":  prereq_c or prereq_a,
 
         "s5b": prereq_a,   # del_mesh step runner (mesh_deletion.py)
-        "s6p": prereq_a,   # preview_del / preview_flux step runner (preview_render.py)
-        "s6":  prereq_e,   # render_3d step runner (render_3d.py)
+        "s6p": prereq_a,   # preview_del step runner (preview_render.py)
         "s6b": prereq_e,   # slat-asset linker (mesh_deletion.py link_slat_assets_batch)
     }
 

@@ -70,7 +70,7 @@ Object-level summary (via ``status.update_step``):
 
 Prerequisite chain
 ------------------
-``gate_a (pass) -> s4 (done) -> s5 (trellis_3d)``
+``gate_a (pass) -> s4 (done) -> s5 (trellis2_3d)``
 
 ``deletion`` edits do NOT go through s4; they go directly to ``s5b_deletion``.
 
