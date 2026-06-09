@@ -1,11 +1,23 @@
-"""Materialize PartCraft edit masks as sidecar training assets.
+"""Materialize TRELLIS.2 edit masks as sidecar training assets.
 
-This module keeps the lightweight bookkeeping and tensor transforms separate
-from the heavy TRELLIS/Open3D runtime. Unit tests can use ``FakeBoxMaskBuilder``;
-production callers can pass a builder that reproduces ``TrellisRefiner.build_part_mask``.
+The mask construction mirrors the dataset export
+(``scripts/export_pxform_v2_dataset.py`` — ``part_struct_grids`` +
+``mask_from_ss``) so training masks are built **exactly** the way the released
+del/add dataset is.  It is v2-native and CPU-only: the edit region is voxelized
+straight from ``mesh_npz`` via
+:func:`partcraft.pipeline_v3.trellis2_part_mask.part_edit_grid_64` — no
+``TrellisRefiner``, no SLAT encode, no Open3D (the old v1 ``build_part_mask``
+path is gone).
 
-:class:`PartCraftRuntimeMaskBuilder.build_mask_detail` additionally materializes
-per-SLAT preserve flags; pass ``include_slat_indices=True`` to :func:`materialize_masks`.
+Resolution follows the active config (``trellis2_edit_res``):
+
+* ``edit_res=512``  → 32³ slat / 16³ ss   (prod default; one ``downsample_edit_grid``)
+* ``edit_res=1024`` → 64³ slat / 16³ ss   (second variant; no slat downsample)
+
+Per-SLAT preserve flags are aligned to the object's prod-encoded SLAT coords
+(``p1_encode/shape_slat_e512.npz`` for 512, ``shape_slat.npz`` for 1024); a coord
+is "keep" iff it is **not** in the 32³/64³ ``edit_grid`` (the ``mask_from_ss``
+rule).  Use ``FakeBoxMaskBuilder`` for dependency-free dry-run plumbing checks.
 """
 from __future__ import annotations
 
@@ -19,167 +31,118 @@ import numpy as np
 from partcraft.pipeline_v3.paths import PipelineRoot
 from partcraft.pipeline_v3.specs import EditSpec, iter_all_specs
 
+# Mirror the config / dataset export (configs ... trellis2_s1_pad: 4, s1_thresh).
+S1_PAD = 4
+S1_THRESH = 0.1
+
 
 class MaskBuilder(Protocol):
-    def build_mask(self, spec: EditSpec) -> np.ndarray:
-        """Return a bool edit mask with shape ``[64, 64, 64]``."""
+    def build(self, spec: EditSpec) -> dict | None:
+        """Return the sidecar payload dict for ``spec`` (or ``None`` to skip)."""
 
 
 class FakeBoxMaskBuilder:
-    """Deterministic lightweight builder for tests and dry-run plumbing checks."""
+    """Deterministic builder for tests / dry-run plumbing checks (no mesh/SLAT)."""
 
-    def build_mask(self, spec: EditSpec) -> np.ndarray:
-        mask = np.zeros((64, 64, 64), dtype=bool)
+    def __init__(self, edit_res: int = 512):
+        self.edit_res = int(edit_res)
+        self.g = self.edit_res // 16  # 32 or 64
+
+    def build(self, spec: EditSpec) -> dict:
         seed = sum(spec.selected_part_ids) if spec.selected_part_ids else spec.edit_idx
-        start = 4 + (seed % 48)
-        mask[start:start + 4, start:start + 4, start:start + 4] = True
-        return mask
+        s = 1 + (seed % max(1, self.g - 2))
+        edit_grid = np.array([[s, s, s], [s + 1, s, s]], dtype=np.int16)
+        keep16 = np.ones((16, 16, 16), dtype=np.uint8)
+        return {
+            "edit_grid": edit_grid,
+            "keep16": keep16,
+            "mask_keep_ss": keep16,
+            "selected_part_ids": np.asarray(spec.selected_part_ids, dtype=np.int32),
+            "edit_type": np.asarray(spec.edit_type),
+            "s1_pad": np.int32(S1_PAD),
+            "s1_thresh": np.float32(S1_THRESH),
+            "edit_res": np.int32(self.edit_res),
+        }
 
 
+class V2StructMaskBuilder:
+    """v2-native edit-mask builder — mirrors the dataset export's mask construction.
 
-
-class _PartVerseMeshAdapter:
-    """Compatibility adapter for TrellisRefiner's mesh accessor names."""
-
-    def __init__(self, record):
-        self._record = record
-
-    def __getattr__(self, name):
-        return getattr(self._record, name)
-
-    @staticmethod
-    def _load_trimesh_from_bytes(raw: bytes, key: str):
-        import io
-        import trimesh
-
-        file_type = key.rsplit(".", 1)[-1]
-        mesh = trimesh.load(io.BytesIO(raw), file_type=file_type, force="scene")
-        if hasattr(mesh, "geometry"):
-            parts = [g for g in mesh.geometry.values() if isinstance(g, trimesh.Trimesh)]
-            if not parts:
-                raise ValueError(f"No triangle mesh geometry found in {key}")
-            return trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
-        return mesh
-
-    def get_full_mesh(self, colored: bool = False):
-        key = "full.glb"
-        return self._load_trimesh_from_bytes(self._record.get_mesh_bytes(key), key)
-
-    def get_part_mesh(self, part_id: int, colored: bool = False):
-        key = f"part_{int(part_id)}.glb"
-        return self._load_trimesh_from_bytes(self._record.get_mesh_bytes(key), key)
-
-
-def _ensure_refiner_record_api(record):
-    if hasattr(record, "get_full_mesh") and hasattr(record, "get_part_mesh"):
-        return record
-    return _PartVerseMeshAdapter(record)
-
-class PartCraftRuntimeMaskBuilder:
-    """Adapter around the real PartCraft ``TrellisRefiner.build_part_mask`` path.
-
-    The caller owns construction of the heavy ``dataset`` and ``refiner``
-    objects so this module remains importable in lightweight test contexts.
-    ``dataset`` must expose ``load_object(shard, obj_id)`` and ``refiner`` must
-    expose ``encode_object`` and ``build_part_mask``.
+    Per spec it reproduces ``part_struct_grids`` (``part_edit_grid_64`` →
+    ``edit_grid_64_to_keep16`` + ``downsample_edit_grid``) and the
+    ``mask_from_ss`` per-SLAT keep, reading the object's prod-encoded SLAT coords
+    from ``p1_encode/``.  CPU-only; no model load.
     """
 
     def __init__(
         self,
         *,
-        dataset,
-        refiner,
-        large_part_threshold: float = 0.35,
-        promote_scale_to_global: bool = False,
-        scale_large_part_threshold: float | None = None,
+        mesh_root: str | Path,
+        pipeline_root: str | Path,
+        edit_res: int = 512,
+        pad: int = S1_PAD,
+        thresh: float = S1_THRESH,
+        canonical: bool = True,
     ):
-        self.dataset = dataset
-        self.refiner = refiner
-        self.large_part_threshold = large_part_threshold
-        self.promote_scale_to_global = promote_scale_to_global
-        self.scale_large_part_threshold = scale_large_part_threshold
-        self._ori_slat_cache = {}
+        self.mesh_root = Path(mesh_root)
+        self.objects_root = Path(pipeline_root) / "objects"
+        self.edit_res = int(edit_res)
+        self.pad = int(pad)
+        self.thresh = float(thresh)
+        self.canonical = bool(canonical)
+        self._slat_grid = self.edit_res // 16          # 32 (512) or 64 (1024)
+        self._factor = 64 // self._slat_grid           # 2 (512) or 1 (1024)
+        # 1024 keeps the main 64³ encode; 512 uses the e512 sidecar.
+        self._slat_name = ("shape_slat.npz" if self.edit_res == 1024
+                           else f"shape_slat_e{self.edit_res}.npz")
 
-    @staticmethod
-    def _edit_part_ids(spec: EditSpec) -> list[int]:
-        et_cap = spec.edit_type.capitalize()
-        if et_cap == "Global":
-            return []
-        return list(spec.selected_part_ids)
+    def _mesh_npz(self, spec: EditSpec) -> Path:
+        return self.mesh_root / spec.shard / f"{spec.obj_id}.npz"
 
-    def _ori_slat(self, obj_id: str):
-        if obj_id not in self._ori_slat_cache:
-            slat = self.refiner.encode_object(None, obj_id)
-            to_device = getattr(slat, "to", None)
-            if callable(to_device):
-                slat = to_device(self.refiner.device)
-            else:
-                slat.coords = slat.coords.to(self.refiner.device)
-                slat.feats = slat.feats.to(self.refiner.device)
-            self._ori_slat_cache[obj_id] = slat
-        return self._ori_slat_cache[obj_id]
+    def _slat_coords(self, spec: EditSpec) -> np.ndarray | None:
+        p = self.objects_root / spec.shard / spec.obj_id / "p1_encode" / self._slat_name
+        if not p.is_file():
+            return None
+        with np.load(p) as z:
+            return np.asarray(z["coords"]).astype(np.int16)
 
-    def build_mask(self, spec: EditSpec) -> np.ndarray:
-        obj_record = self.dataset.load_object(spec.shard, spec.obj_id)
-        try:
-            obj_record_for_refiner = _ensure_refiner_record_api(obj_record)
-            et_cap = spec.edit_type.capitalize()
-            mask, _effective_type = self.refiner.build_part_mask(
-                spec.obj_id,
-                obj_record_for_refiner,
-                self._edit_part_ids(spec),
-                self._ori_slat(spec.obj_id),
-                et_cap,
-                large_part_threshold=self.large_part_threshold,
-                promote_scale_to_global=self.promote_scale_to_global,
-                scale_large_part_threshold=self.scale_large_part_threshold,
-            )
-            return mask.detach().cpu().numpy().astype(bool)
-        finally:
-            close = getattr(obj_record, "close", None)
-            if callable(close):
-                close()
+    def _struct_grids(self, spec: EditSpec):
+        """Reproduces export part_struct_grids → (keep16 16³, edit_grid [M,3])."""
+        import torch
+        from partcraft.pipeline_v3.trellis2_part_mask import (
+            part_edit_grid_64, edit_grid_64_to_keep16, downsample_edit_grid)
+        pids = [int(x) for x in spec.selected_part_ids]
+        g64 = part_edit_grid_64(self._mesh_npz(spec), pids, pad=self.pad,
+                                canonical=self.canonical)
+        keep16 = edit_grid_64_to_keep16(g64, thresh=self.thresh).cpu().numpy().astype(np.uint8)
+        g = downsample_edit_grid(g64, self._factor) if self._factor > 1 else g64
+        edit_grid = torch.nonzero(g).to(torch.int16).cpu().numpy()
+        return keep16, edit_grid
 
-    def build_mask_detail(self, spec: EditSpec) -> dict[str, object]:
-        """Same path as :meth:`build_mask`, plus SLAT-aligned index arrays.
-
-        The returned ``mask_edit_64`` matches the boolean tensor passed into
-        ``interweave_Trellis_TI`` — **True** means the voxel is in the *editable*
-        region.  Per-SLAT-point flags are::
-
-            slat_in_edit_region = mask_edit_64[slat_xyz[:,0], slat_xyz[:,1], slat_xyz[:,2]]
-            slat_preserve = ~slat_in_edit_region
-        """
-        obj_record = self.dataset.load_object(spec.shard, spec.obj_id)
-        try:
-            obj_record_for_refiner = _ensure_refiner_record_api(obj_record)
-            et_cap = spec.edit_type.capitalize()
-            slat = self._ori_slat(spec.obj_id)
-            mask, effective_type = self.refiner.build_part_mask(
-                spec.obj_id,
-                obj_record_for_refiner,
-                self._edit_part_ids(spec),
-                slat,
-                et_cap,
-                large_part_threshold=self.large_part_threshold,
-                promote_scale_to_global=self.promote_scale_to_global,
-                scale_large_part_threshold=self.scale_large_part_threshold,
-            )
-            m = mask.detach().cpu().numpy().astype(bool)
-            xyz = slat.coords[:, 1:].detach().cpu().numpy().astype(np.int16)
-            edit_at = m[xyz[:, 0], xyz[:, 1], xyz[:, 2]]
-            preserve_at = ~edit_at
-            return {
-                "mask_edit_64": m.astype(np.uint8),
-                "effective_edit_type": str(effective_type),
-                "slat_coords": xyz,
-                "slat_in_edit_region": edit_at.astype(np.uint8),
-                "slat_preserve": preserve_at.astype(np.uint8),
-            }
-        finally:
-            close = getattr(obj_record, "close", None)
-            if callable(close):
-                close()
+    def build(self, spec: EditSpec) -> dict | None:
+        if not self._mesh_npz(spec).is_file():
+            return None
+        keep16, edit_grid = self._struct_grids(spec)
+        payload: dict[str, np.ndarray] = {
+            "edit_grid": edit_grid,
+            "keep16": keep16,
+            "mask_keep_ss": keep16,                     # export-name alias
+            "selected_part_ids": np.asarray(spec.selected_part_ids, dtype=np.int32),
+            "edit_type": np.asarray(spec.edit_type),
+            "s1_pad": np.int32(self.pad),
+            "s1_thresh": np.float32(self.thresh),
+            "edit_res": np.int32(self.edit_res),
+        }
+        slat = self._slat_coords(spec)
+        if slat is not None:
+            # mask_from_ss rule: keep iff the SLAT coord is NOT in edit_grid.
+            eg = {tuple(int(x) for x in c) for c in edit_grid.tolist()}
+            keep = np.fromiter(
+                (tuple(int(x) for x in c) not in eg for c in slat.tolist()),
+                dtype=np.uint8, count=len(slat))
+            payload["slat_coords"] = slat
+            payload["mask_keep_slat"] = keep
+        return payload
 
 
 def _pipeline_root_from_parsed_path(parsed_path: Path) -> PipelineRoot:
@@ -235,97 +198,28 @@ def iter_addition_specs_from_object_dir(obj_dir: str | Path) -> Iterator[EditSpe
         )
 
 
-def dilate_edit_mask_64(mask_edit_64: np.ndarray, radius: int = 1) -> np.ndarray:
-    mask = np.asarray(mask_edit_64).astype(bool)
-    if mask.shape != (64, 64, 64):
-        raise ValueError(f"mask_edit_64 must have shape (64, 64, 64), got {mask.shape}")
-    if radius <= 0:
-        return mask.copy()
-
-    try:
-        from scipy.ndimage import binary_dilation
-
-        structure = np.ones((3, 3, 3), dtype=bool)
-        return binary_dilation(mask, structure=structure, iterations=radius).astype(bool)
-    except Exception:
-        # Small dependency-free fallback. Radius is expected to be 1 for smoke/tests.
-        out = mask.copy()
-        for _ in range(radius):
-            padded = np.pad(out, 1, mode="constant", constant_values=False)
-            next_out = np.zeros_like(out, dtype=bool)
-            for dz in (-1, 0, 1):
-                for dy in (-1, 0, 1):
-                    for dx in (-1, 0, 1):
-                        next_out |= padded[
-                            1 + dz:1 + dz + 64,
-                            1 + dy:1 + dy + 64,
-                            1 + dx:1 + dx + 64,
-                        ]
-            out = next_out
-        return out
-
-
-def mask_keep_from_edit(mask_edit_64: np.ndarray, dilation_radius: int = 1) -> np.ndarray:
-    dilated = dilate_edit_mask_64(mask_edit_64, radius=dilation_radius)
-    return (~dilated).astype(np.uint8)
-
-
-def downsample_keep_mask_to_ss(mask_keep_64: np.ndarray) -> np.ndarray:
-    keep = np.asarray(mask_keep_64).astype(np.uint8)
-    if keep.shape != (64, 64, 64):
-        raise ValueError(f"mask_keep_64 must have shape (64, 64, 64), got {keep.shape}")
-    blocks = keep.reshape(16, 4, 16, 4, 16, 4)
-    return blocks.min(axis=(1, 3, 5)).astype(np.uint8)
-
-
 def _sidecar_path(output_root: Path, spec: EditSpec) -> Path:
     return output_root / spec.edit_type / spec.shard / spec.obj_id / f"{spec.edit_id}.npz"
 
 
-def _write_sidecar(
-    output_root: Path,
-    spec: EditSpec,
-    mask_edit_64: np.ndarray,
-    dilation_radius: int,
-    *,
-    slat_coords: np.ndarray | None = None,
-    slat_in_edit_region: np.ndarray | None = None,
-    slat_preserve: np.ndarray | None = None,
-) -> dict:
-    mask_edit_64 = np.asarray(mask_edit_64).astype(np.uint8)
-    if mask_edit_64.shape != (64, 64, 64):
-        raise ValueError(f"builder returned bad mask shape for {spec.edit_id}: {mask_edit_64.shape}")
-    mask_keep_64 = mask_keep_from_edit(mask_edit_64, dilation_radius=dilation_radius)
-    mask_keep_ss = downsample_keep_mask_to_ss(mask_keep_64)
-
+def _write_sidecar(output_root: Path, spec: EditSpec, payload: dict) -> dict:
     path = _sidecar_path(output_root, spec)
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    payload: dict[str, np.ndarray] = {
-        "mask_edit_64": mask_edit_64,
-        "mask_keep_64": mask_keep_64,
-        "mask_keep_ss": mask_keep_ss,
-        "selected_part_ids": np.asarray(spec.selected_part_ids, dtype=np.int32),
-        "edit_type": np.asarray(spec.edit_type),
-    }
-    if slat_coords is not None:
-        payload["slat_coords"] = np.asarray(slat_coords, dtype=np.int16)
-        payload["slat_in_edit_region"] = np.asarray(slat_in_edit_region, dtype=np.uint8)
-        payload["slat_preserve"] = np.asarray(slat_preserve, dtype=np.uint8)
-
     np.savez_compressed(path, **payload)
 
-    row = {
+    keep16 = np.asarray(payload["keep16"], dtype=np.uint8)
+    return {
         "edit_id": spec.edit_id,
         "edit_type": spec.edit_type,
         "shard": spec.shard,
         "obj_id": spec.obj_id,
         "mask_path": str(path.relative_to(output_root)),
-        "keep_ratio_ss": float(mask_keep_ss.mean()),
+        "edit_res": int(np.asarray(payload["edit_res"])),
+        "n_edit_voxels": int(len(payload["edit_grid"])),
+        "keep_ratio_ss": float(keep16.mean()),
         "selected_part_ids": list(spec.selected_part_ids),
-        "has_slat_indices": slat_coords is not None,
+        "has_slat": "mask_keep_slat" in payload,
     }
-    return row
 
 
 def _iter_object_dirs(pipeline_root: Path, shards: Iterable[str] | None) -> Iterator[Path]:
@@ -352,8 +246,6 @@ def materialize_masks(
     min_edit_voxels: int = 0,
     allowed_edit_ids: set[str] | None = None,
     mask_builder: MaskBuilder | None = None,
-    dilation_radius: int = 1,
-    include_slat_indices: bool = False,
 ) -> list[dict]:
     pipeline_root = Path(pipeline_root)
     output_root = Path(output_root)
@@ -374,45 +266,22 @@ def materialize_masks(
                 continue
             if allowed_edit_ids is not None and spec.edit_id not in allowed_edit_ids:
                 continue
-            if spec.edit_type == "global":
-                continue
+            if spec.edit_type == "global" or not spec.selected_part_ids:
+                continue  # part-based edit region needs target parts
             if max_per_type is not None and counts_by_type.get(spec.edit_type, 0) >= max_per_type:
                 continue
-            if include_slat_indices:
-                if not isinstance(mask_builder, PartCraftRuntimeMaskBuilder):
-                    raise ValueError(
-                        "include_slat_indices=True requires PartCraftRuntimeMaskBuilder"
-                    )
-                det = mask_builder.build_mask_detail(spec)
-                effective = det.get("effective_edit_type")
-                mask_u8 = np.asarray(det["mask_edit_64"], dtype=np.uint8)
-                sc = np.asarray(det["slat_coords"], dtype=np.int16)
-                sie = np.asarray(det["slat_in_edit_region"], dtype=np.uint8)
-                sp = np.asarray(det["slat_preserve"], dtype=np.uint8)
-                mask = mask_u8
-            else:
-                effective = None
-                mask = mask_builder.build_mask(spec)
-                sc = sie = sp = None
-            if int(np.asarray(mask).astype(bool).sum()) < min_edit_voxels:
+            payload = mask_builder.build(spec)
+            if payload is None:
                 continue
-            row = _write_sidecar(
-                output_root,
-                spec,
-                mask,
-                dilation_radius,
-                slat_coords=sc,
-                slat_in_edit_region=sie,
-                slat_preserve=sp,
-            )
-            if effective is not None:
-                row["effective_edit_type"] = str(effective)
-            rows.append(row)
+            if len(payload["edit_grid"]) < min_edit_voxels:
+                continue
+            rows.append(_write_sidecar(output_root, spec, payload))
             counts_by_type[spec.edit_type] = counts_by_type.get(spec.edit_type, 0) + 1
             if max_edits is not None and len(rows) >= max_edits:
                 _write_manifest(output_root, rows)
                 return rows
-            if max_per_type is not None and target_types and all(counts_by_type.get(t, 0) >= max_per_type for t in target_types):
+            if max_per_type is not None and target_types and all(
+                    counts_by_type.get(t, 0) >= max_per_type for t in target_types):
                 _write_manifest(output_root, rows)
                 return rows
 
@@ -428,58 +297,46 @@ def _write_manifest(output_root: Path, rows: list[dict]) -> None:
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Materialize PartCraft true edit masks as sidecar npz files.")
+    parser = argparse.ArgumentParser(
+        description="Materialize v2 (TRELLIS.2) edit masks as sidecar npz, "
+                    "mirroring the dataset export's part_struct_grids + mask_from_ss.")
     parser.add_argument("--pipeline-root", required=True)
     parser.add_argument("--output-root", required=True)
-    parser.add_argument("--images-root", default=None)
-    parser.add_argument("--mesh-root", default=None)
-    parser.add_argument("--slat-root", default=None)
-    parser.add_argument("--ckpt-root", default=None)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--mesh-root", default=None,
+                        help="Source partverse mesh root (<mesh-root>/<shard>/<obj>.npz). Required unless --fake-builder.")
     parser.add_argument("--shards", nargs="*", default=None)
-    parser.add_argument("--edit-types", nargs="*", default=["deletion", "addition", "modification", "scale"])
+    parser.add_argument("--edit-types", nargs="*",
+                        default=["deletion", "addition", "modification", "scale"])
+    parser.add_argument("--edit-res", type=int, default=512, choices=[512, 1024],
+                        help="512 -> 32³ slat / 16³ ss (prod config); 1024 -> 64³ slat.")
+    parser.add_argument("--pad", type=int, default=S1_PAD)
+    parser.add_argument("--thresh", type=float, default=S1_THRESH)
+    parser.add_argument("--no-canonical", action="store_true",
+                        help="Disable canonical-frame normalization (default on, matches config).")
     parser.add_argument("--max-edits", type=int, default=None)
     parser.add_argument("--max-per-type", type=int, default=None)
     parser.add_argument("--min-edit-voxels", type=int, default=0)
     parser.add_argument("--allowed-edit-ids-file", default=None)
-    parser.add_argument("--dilation-radius", type=int, default=1)
-    parser.add_argument(
-        "--include-slat-indices",
-        action="store_true",
-        help="Also write slat_coords / slat_preserve arrays (requires real builder).",
-    )
-    parser.add_argument("--fake-builder", action="store_true", help="Use deterministic fake masks for dry-run validation.")
+    parser.add_argument("--fake-builder", action="store_true",
+                        help="Synthetic masks for dependency-free dry-run plumbing checks.")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.fake_builder:
-        builder = FakeBoxMaskBuilder()
+        builder: MaskBuilder = FakeBoxMaskBuilder(edit_res=args.edit_res)
     else:
-        missing = [
-            name for name, value in {
-                "--images-root": args.images_root,
-                "--mesh-root": args.mesh_root,
-                "--slat-root": args.slat_root,
-                "--ckpt-root": args.ckpt_root,
-            }.items()
-            if not value
-        ]
-        if missing:
-            raise SystemExit(f"Real mask materialization requires {' '.join(missing)}")
-        from partcraft.io.partverse_dataset import PartVerseDataset
-        from partcraft.trellis.refiner import TrellisRefiner
-
-        dataset = PartVerseDataset(args.images_root, args.mesh_root, args.shards, slat_dir=args.slat_root)
-        refiner = TrellisRefiner(
-            cache_dir=Path(args.output_root) / "_refiner_cache",
-            device=args.device,
-            ckpt_dir=args.ckpt_root,
-            slat_dir=args.slat_root,
-            image_edit_backend="local_diffusers",
+        if not args.mesh_root:
+            raise SystemExit("real mask materialization requires --mesh-root")
+        builder = V2StructMaskBuilder(
+            mesh_root=args.mesh_root,
+            pipeline_root=args.pipeline_root,
+            edit_res=args.edit_res,
+            pad=args.pad,
+            thresh=args.thresh,
+            canonical=not args.no_canonical,
         )
-        builder = PartCraftRuntimeMaskBuilder(dataset=dataset, refiner=refiner)
 
     allowed_edit_ids = None
     if args.allowed_edit_ids_file:
@@ -499,10 +356,14 @@ def main(argv: list[str] | None = None) -> int:
         min_edit_voxels=args.min_edit_voxels,
         allowed_edit_ids=allowed_edit_ids,
         mask_builder=builder,
-        dilation_radius=args.dilation_radius,
-        include_slat_indices=args.include_slat_indices,
     )
-    print(json.dumps({"count": len(rows), "output_root": str(Path(args.output_root))}, indent=2))
+    from collections import Counter
+    print(json.dumps({
+        "count": len(rows),
+        "by_type": dict(Counter(r["edit_type"] for r in rows)),
+        "edit_res": args.edit_res,
+        "output_root": str(Path(args.output_root)),
+    }, indent=2))
     return 0
 
 

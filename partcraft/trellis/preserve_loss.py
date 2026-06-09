@@ -15,7 +15,7 @@ loop.  Use the helpers below when wiring a custom trainer.
 2. ``PreserveLossSpace.SS_LATENT`` — compare ``z_s`` tensors from
    ``sparse_structure_encoder`` (shape ``[C, R, R, R]``).  A coarse keep-mask
    can be obtained via
-   :func:`partcraft.pipeline_v3.mask_materialization.downsample_keep_mask_to_ss`
+   :attr:`partcraft.pipeline_v3.mask_materialization.V2StructMaskBuilder` (``keep16``)
    (16³) **if** ``R == 16``; otherwise resize / reproject to match ``z_s`` spatial
    dims.
 
@@ -24,8 +24,8 @@ loop.  Use the helpers below when wiring a custom trainer.
    renderer or point-cloud term.
 
 See also
-:class:`partcraft.pipeline_v3.mask_materialization.PartCraftRuntimeMaskBuilder.build_mask_detail`
-for exporting masks + SLAT indices.
+:meth:`partcraft.pipeline_v3.mask_materialization.V2StructMaskBuilder.build`
+for exporting masks + per-SLAT keep flags.
 """
 
 from __future__ import annotations
@@ -171,7 +171,7 @@ def training_entrypoints_inventory() -> dict[str, list[str]]:
         ],
         "trellis_inference_core": [
             "partcraft/trellis/refiner.py",
-            "partcraft/pipeline_v3/trellis_3d.py",
+            "partcraft/pipeline_v3/trellis2_3d.py",
         ],
         "ss_encode_util": [
             "partcraft/io/npz_utils.py (encode_ss)",
