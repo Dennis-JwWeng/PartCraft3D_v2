@@ -35,17 +35,21 @@ VIEW_FOV_DEG = 40.0
 # (looking down).  front/right/back/left are AXIS-ALIGNED (0/90/180/270) so each
 # directly faces one side of the object (orthographic-like front view, NOT the
 # old ~45°-offset corner/3-quarter angles), at a slight overhead tilt (~22°).
-# ``down`` keeps the original low front-upward viewpoint.
+# ``down`` = low front-upward (legacy overview column 4).
+# ``top`` / ``bottom`` = near-orthogonal vertical views for 6-view before/after.
 NAMED_VIEWS: dict[str, tuple[float, float]] = {
     "front": (0.0,    22.0),
     "right": (90.0,   22.0),
     "back":  (180.0,  22.0),
     "left":  (270.0,  22.0),
-    "down":  (22.5000, -63.2951),   # kept (was view 8)
+    "down":  (22.5000, -63.2951),   # legacy overview column 4
+    "top":   (0.0,    89.0),        # +Z down (俯视)
+    "bottom": (0.0,  -89.0),        # -Z up (仰视)
 }
-# overview column order (column k = VIEW_ORDER[k]); gate-A's 0..4 column logic
-# is unchanged — only the column→camera mapping moved here.
+# Gate-A / overview pipeline (5 columns, unchanged).
 VIEW_ORDER: list[str] = ["front", "right", "back", "left", "down"]
+# Part-edit before/after compare: 前后左右上下.
+SIX_VIEW_ORDER: list[str] = ["front", "back", "left", "right", "top", "bottom"]
 
 
 def view_yaw_pitch(name: str) -> tuple[float, float]:
@@ -254,7 +258,7 @@ def render_sample(
 
 
 __all__ = [
-    "NAMED_VIEWS", "VIEW_ORDER", "VIEW_RADIUS", "VIEW_FOV_DEG",
+    "NAMED_VIEWS", "VIEW_ORDER", "SIX_VIEW_ORDER", "VIEW_RADIUS", "VIEW_FOV_DEG",
     "view_yaw_pitch", "named_cameras", "camera_transforms",
     "render_ovoxel", "shade", "render_sample", "load_envmap",
 ]
