@@ -295,8 +295,9 @@ def check_inputs(
         if ctx.mesh_npz is None or not ctx.mesh_npz.is_file():
             missing.append(f"mesh_npz ({ctx.mesh_npz})")
 
-        if ctx.image_npz is None or not ctx.image_npz.is_file():
-            missing.append(f"image_npz ({ctx.image_npz})")
+        if roots.require_images_npz:
+            if ctx.image_npz is None or not ctx.image_npz.is_file():
+                missing.append(f"image_npz ({ctx.image_npz})")
 
         if roots.slat_dir is not None:
             try:

@@ -1041,7 +1041,7 @@ USER_PROMPT_TEXT_SEMANTIC = """# PART LIST  (id · description)
 #
 def build_semantic_list(
     mesh_npz: Path,
-    img_npz: Path,
+    img_npz: "Path | None" = None,
     anno_obj_dir: "Path | None" = None,
 ) -> tuple[list[int], str]:
     """Text-only semantic part list — for text_semantic mode (Mode B).
@@ -1050,16 +1050,22 @@ def build_semantic_list(
     Uses PartVerse text_captions when available; falls back to "part_N".
     No palette colours.
 
+    ``img_npz`` is optional when ``mesh_npz`` embeds ``part_captions.json``
+    (PartVerse XL mesh-only pack).  Legacy v1 packs still pass images NPZ for
+    ``split_mesh.json`` fallback names.
+
     Format per line:
         part_{id:<3d}  "{name}"
     """
     import re as _re
     import numpy as _np
 
-    z = _np.load(img_npz, allow_pickle=True)
-    sm = json.loads(bytes(z["split_mesh.json"]).decode())
-    clusters = sm.get("valid_clusters", {})
-    pid_to_name_raw = sm.get("part_id_to_name", [])
+    pid_to_name_raw: list = []
+    if img_npz is not None and Path(img_npz).is_file():
+        z = _np.load(img_npz, allow_pickle=True)
+        if "split_mesh.json" in z.files:
+            sm = json.loads(bytes(z["split_mesh.json"]).decode())
+            pid_to_name_raw = sm.get("part_id_to_name", [])
 
     z2 = _np.load(mesh_npz, allow_pickle=True)
 

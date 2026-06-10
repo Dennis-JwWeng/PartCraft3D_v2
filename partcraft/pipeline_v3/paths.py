@@ -54,6 +54,7 @@ class DatasetRoots:
     slat_dir: Path | None = None       # bench/inputs/slat  (sharded: /08/{obj_id}_*.pt)
     normalized_glb_dir: Path | None = None
     anno_dir: Path | None = None
+    require_images_npz: bool = True    # Trellis2 mesh-only packs omit images NPZ
 
     @classmethod
     def from_pipeline_cfg(cls, cfg: dict) -> "DatasetRoots":
@@ -67,6 +68,7 @@ class DatasetRoots:
             slat_dir=Path(raw_slat) if raw_slat else None,
             normalized_glb_dir=Path(raw_glb) if raw_glb else None,
             anno_dir=Path(raw_anno) if raw_anno else None,
+            require_images_npz=bool(data.get("require_images_npz", True)),
         )
 
     def input_npz_paths(self, shard: str | int, obj_id: str) -> tuple[Path, Path]:

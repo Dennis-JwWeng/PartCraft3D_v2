@@ -69,10 +69,15 @@ def prepare_edit_menu(
 
     Side effect: creates ``ctx.phase1_dir`` if needed.
     """
-    if ctx.mesh_npz is None or ctx.image_npz is None:
-        raise ValueError(f"{ctx} missing mesh_npz/image_npz")
+    if ctx.mesh_npz is None:
+        raise ValueError(f"{ctx} missing mesh_npz")
+    img_npz = (
+        ctx.image_npz
+        if (ctx.image_npz is not None and ctx.image_npz.is_file())
+        else None
+    )
     _anno = (anno_dir / ctx.obj_id) if anno_dir else None
-    pids, menu = build_semantic_list(ctx.mesh_npz, ctx.image_npz, anno_obj_dir=_anno)
+    pids, menu = build_semantic_list(ctx.mesh_npz, img_npz, anno_obj_dir=_anno)
     if len(pids) > MAX_PARTS:
         return None
     quota = compute_edit_quota(len(pids))
@@ -346,8 +351,9 @@ def _render_overview_worker(args: tuple) -> tuple[str, str, str]:
         out_p.parent.mkdir(parents=True, exist_ok=True)
         # o-voxel overview (no Blender, no input images); save the camera record
         # next to overview.png so downstream keeps the per-view viewpoint info.
+        _img = _P(image_npz) if image_npz and str(image_npz).strip() else None
         png = render_overview_png(
-            _P(mesh_npz), _P(image_npz), blender,
+            _P(mesh_npz), _img, blender,
             save_viewpoints=out_p.parent / "viewpoints.json")
         # write atomically so a crash mid-render never leaves a torn file
         tmp = out_p.with_suffix(".png.tmp")
@@ -380,13 +386,16 @@ def backfill_overviews(
 
     tasks: list[tuple] = []
     for ctx in ctxs:
-        if ctx.mesh_npz is None or ctx.image_npz is None:
+        if ctx.mesh_npz is None or not ctx.mesh_npz.is_file():
             continue
-        if not ctx.mesh_npz.is_file() or not ctx.image_npz.is_file():
-            continue
+        img = (
+            str(ctx.image_npz)
+            if (ctx.image_npz is not None and ctx.image_npz.is_file())
+            else ""
+        )
         ctx.phase1_dir.mkdir(parents=True, exist_ok=True)
         tasks.append((
-            ctx.obj_id, str(ctx.mesh_npz), str(ctx.image_npz),
+            ctx.obj_id, str(ctx.mesh_npz), img,
             blender, str(ctx.overview_path), force,
         ))
 
@@ -446,7 +455,8 @@ def _prepare_edit_menu_worker(args: tuple) -> tuple | None:
         MAX_PARTS as _MAX,
         _pick_global_edit_note,
     )
-    mesh_p = _P(mesh_npz); img_p = _P(image_npz)
+    mesh_p = _P(mesh_npz)
+    img_p = _P(image_npz) if image_npz and image_npz.strip() else None
     _anno_p = _P(anno_obj_dir_str) if anno_obj_dir_str else None
     pids, menu = _bsl(mesh_p, img_p, anno_obj_dir=_anno_p)
     if len(pids) > _MAX:
@@ -520,7 +530,7 @@ async def gen_edits_streaming(
         if not force and step_done(ctx, "s1_phase1"):
             results.append(Phase1Result(ctx.obj_id, ok=True))
             continue
-        if ctx.mesh_npz is None or ctx.image_npz is None:
+        if ctx.mesh_npz is None or not ctx.mesh_npz.is_file():
             results.append(Phase1Result(ctx.obj_id, ok=False, error="no_input"))
             continue
         todo.append(ctx)
@@ -562,9 +572,14 @@ async def gen_edits_streaming(
     async def build_one(ctx: ObjectContext):
         try:
             _anno_dir = (anno_dir / ctx.obj_id) if anno_dir else None
+            _img = (
+                str(ctx.image_npz)
+                if (ctx.image_npz is not None and ctx.image_npz.is_file())
+                else ""
+            )
             pre = await loop.run_in_executor(
                 pool, _prepare_edit_menu_worker,
-                (str(ctx.mesh_npz), str(ctx.image_npz),
+                (str(ctx.mesh_npz), _img,
                  blender, "",  # unused slot kept for worker signature compat
                  str(_anno_dir) if _anno_dir else ""),
             )
