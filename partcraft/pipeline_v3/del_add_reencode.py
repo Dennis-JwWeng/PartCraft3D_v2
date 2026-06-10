@@ -56,7 +56,7 @@ from partcraft.render.ovox_views import VIEW_ORDER
 
 S1_PAD = 4          # matches config trellis2_s1_pad
 S1_THRESH = 0.1     # matches config s1_thresh
-_LAT_FILES = ("shape_slat.npz", "tex_slat.npz", "ss.npz")
+_LAT_FILES = ("shape_slat.npz", "tex_slat.npz", "ss.npz", "ss_latent.npz", "mask.npz")
 
 
 @dataclass
@@ -71,9 +71,11 @@ class DelAddResult:
 
 # ───────────────────────── kernel (lifted from export script) ─────────────────────────
 def encode_after_512(encoders, orig_mesh_npz, after_glb, canonical, grid_size=512):
-    """shape+tex SLat for ``after_new.glb``, normalized with the ORIGINAL mesh's M so
-    the deleted-result coords share the same 32³ grid as the e512 'before'.  No ss_enc
-    (the dataset's after-ss is structural metadata, not a re-encoded latent)."""
+    """shape+tex SLat (@32³) + after SS latent (@16³) for ``after_new.glb``, normalized
+    with the ORIGINAL mesh's M so the deleted-result coords share the same 32³ grid as
+    the e512 'before'.  The after SS latent = ``ss_enc`` of the deleted mesh's 64³
+    occupancy (byte-compatible with ``p1_encode/ss.npz``); it is del.after = add.before's
+    condition latent — the S1 training target for the deleted state."""
     import trimesh, torch, o_voxel
     import trellis2.modules.sparse as sp
     from partcraft.pipeline_v3 import trellis2_ovox_render as OVR
@@ -109,11 +111,37 @@ def encode_after_512(encoders, orig_mesh_npz, after_glb, canonical, grid_size=51
     tsp = sp.SparseTensor(feats=feats6, coords=tx_coords).cuda()
     with torch.no_grad():
         tex_slat = encoders["tex"](tsp)
+    # after SS latent: ss_enc of the 64³ occupancy, the SAME path
+    # trellis2_encode.encode_shape_tex_ss uses for p1_encode/ss.npz → [1,8,16³].
+    # The 64³ occupancy = the SHAPE-ENCODER OUTPUT coords at grid_size=1024 (the
+    # encoder compresses the fine dual grid 1024→64³), NOT the raw voxelization
+    # (raw vi is on the fine 0..1023 grid → would index occ[64] out of range).
+    vi1, dv1, inter1 = o_voxel.convert.mesh_to_flexible_dual_grid(
+        verts.cpu(), faces.cpu(), grid_size=1024, aabb=aabb,
+        face_weight=1.0, boundary_weight=0.2, regularization_weight=1e-2, timing=False)
+    dual1 = (dv1 * 1024 - vi1).clamp(0., 1.).float()
+    if inter1.dim() == 2 and inter1.shape[1] == 3:
+        inter3_1 = inter1.float()
+    else:
+        b1 = inter1.view(-1).to(torch.uint8)
+        inter3_1 = torch.stack([(b1 & 1).bool(), ((b1 >> 1) & 1).bool(),
+                                ((b1 >> 2) & 1).bool()], -1).float()
+    sh_coords_1 = torch.cat([torch.zeros_like(vi1[:, :1]), vi1], -1).int()
+    vsp1 = sp.SparseTensor(feats=dual1, coords=sh_coords_1).cuda()
+    isp1 = vsp1.replace(inter3_1.bool().float().cuda())
+    with torch.no_grad():
+        shape_slat_64 = encoders["shape"](vsp1, isp1)
+    c64 = shape_slat_64.coords[:, 1:].long()
+    occ = torch.zeros(1, 1, 64, 64, 64, device=shape_slat_64.device)
+    occ[0, 0, c64[:, 0], c64[:, 1], c64[:, 2]] = 1.0
+    with torch.no_grad():
+        z_ss = encoders["ss"](occ.float())
     return {
         "shape_feats": shape_slat.feats.cpu().numpy().astype(np.float32),
         "shape_coords": shape_slat.coords[:, 1:].cpu().numpy().astype(np.int32),
         "tex_feats": tex_slat.feats.cpu().numpy().astype(np.float32),
         "tex_coords": tex_slat.coords[:, 1:].cpu().numpy().astype(np.int32),
+        "ss_latent": z_ss.detach().cpu().numpy().astype(np.float32),
     }
 
 
@@ -183,10 +211,11 @@ def _slat_from_arrays(feats, coords):
 
 
 def _write_del_add_latents(edit_dir, shape_after, tex_after, ss_dict, logger,
-                           *, write_mask=False):
-    """Write edit_dir/latents/{ss,shape_slat,tex_slat}.npz in the SAME schema as
-    trellis2_3d._save_edit_latents (so del/add sit next to mod/scale uniformly).
-    Optionally also writes latents/mask.npz (kept OFF by default for prod symmetry)."""
+                           *, ss_latent=None, write_mask=True):
+    """Write edit_dir/latents/{ss,shape_slat,tex_slat,ss_latent,mask}.npz in the SAME
+    schema as trellis2_3d._save_edit_latents (so del/add sit next to mod/scale
+    uniformly).  ``ss_latent`` ([1,8,16,16,16]) is the after SS latent; ``mask.npz`` is
+    the pure-function keep mask from the ss region pack."""
     from partcraft.pipeline_v3.trellis2_3d import _save_edit_latents
     latents = {
         "coords0": ss_dict["coords0"],
@@ -199,6 +228,7 @@ def _write_del_add_latents(edit_dir, shape_after, tex_after, ss_dict, logger,
         "s1_thresh": ss_dict["s1_thresh"],
         "shape_feats": shape_after["feats"], "shape_coords": shape_after["coords"],
         "tex_feats": tex_after["feats"], "tex_coords": tex_after["coords"],
+        "ss_latent": ss_latent,   # after SS latent → latents/ss_latent.npz
     }
     _save_edit_latents(latents, edit_dir, logger)
     if write_mask:
@@ -264,6 +294,10 @@ def run_del_add_for_object(ctx: ObjectContext, *, encoders, pipeline, p25_cfg,
         res.error = "missing e512 sidecars"; res.n_fail = len(dels_parsed); return res
     orig_sh = dict(np.load(sh_e512))   # feats, coords (32³) = del.before / add.after
     orig_tx = dict(np.load(tx_e512))
+    # original SS latent (p1) = del.before / add.after's SS latent; reused verbatim
+    # for the addition's after (no re-encode — add.after IS the original object).
+    p1_ss = p1 / "ss.npz"
+    orig_ss = (np.load(p1_ss)["ss"].astype(np.float32) if p1_ss.is_file() else None)
     gate_dir = ctx.dir / "gate_views"
 
     for seq, spec in enumerate(dels_parsed):
@@ -294,18 +328,20 @@ def run_del_add_for_object(ctx: ObjectContext, *, encoders, pipeline, p25_cfg,
             sh_after_add = {"feats": orig_sh["feats"], "coords": orig_sh["coords"].astype(np.int16)}
             tx_after_add = {"feats": orig_tx["feats"], "coords": orig_tx["coords"].astype(np.int16)}
 
-            # ── render after-views: del = decode deleted; add = copy original before-views ──
+            # ── render after-views: ONLY the best_view (= before's selected view).
+            #    del = decode deleted → render bv; add = copy original before_view_bv ──
             if render_after_views:
-                _render_del_after_views(pipeline, p25_cfg, enc, del_dir, logger)
-                _copy_before_to_add_after_views(gate_dir, add_dir, logger)
+                _render_del_after_views(pipeline, p25_cfg, enc, del_dir, vname, logger)
+                _copy_before_to_add_after_views(gate_dir, add_dir, vname, logger)
 
             # ── deletion: before = original e512, after = deleted ──
+            #    after SS latent = ss_enc(deleted 64³) (= add.before's condition latent)
             ss_del = {"coords0": orig_sh["coords"].astype(np.int16),
                       "coords_new": enc["shape_coords"].astype(np.int16),
                       "edit_grid": edit_grid, "keep16": keep16, "parts": parts,
                       "edit_type": "deletion", "s1_pad": S1_PAD, "s1_thresh": S1_THRESH}
             _write_del_add_latents(del_dir, sh_after_del, tx_after_del, ss_del, logger,
-                                   write_mask=write_mask)
+                                   ss_latent=enc.get("ss_latent"), write_mask=write_mask)
             update_edit_stage(ctx, del_id, "deletion", "del_add", status="done",
                               verdict={"best_view": bv, "view_name": vname,
                                        "view_source": "overview_part_pixel_argmax"})
@@ -316,12 +352,13 @@ def run_del_add_for_object(ctx: ObjectContext, *, encoders, pipeline, p25_cfg,
                 edit_id=del_id, selected_part_ids=pids, view_index=bv,
                 prompt=spec.get("prompt", ""), target_part_desc=spec.get("target_part_desc", ""),
                 object_desc=obj_desc), seq, force=force, logger=logger)
+            #    after SS latent = original object's SS latent (p1_encode/ss.npz) verbatim
             ss_add = {"coords0": enc["shape_coords"].astype(np.int16),
                       "coords_new": orig_sh["coords"].astype(np.int16),
                       "edit_grid": edit_grid, "keep16": keep16, "parts": parts,
                       "edit_type": "addition", "s1_pad": S1_PAD, "s1_thresh": S1_THRESH}
             _write_del_add_latents(add_dir, sh_after_add, tx_after_add, ss_add, logger,
-                                   write_mask=write_mask)
+                                   ss_latent=orig_ss, write_mask=write_mask)
             update_edit_stage(ctx, add_id, "addition", "del_add", status="done",
                               verdict={"best_view": bv, "view_name": vname,
                                        "paired_deletion_edit_id": del_id,
@@ -339,23 +376,35 @@ def run_del_add_for_object(ctx: ObjectContext, *, encoders, pipeline, p25_cfg,
     return res
 
 
-def _render_del_after_views(pipeline, p25_cfg, enc, del_dir, logger):
-    """Decode the deleted latents → mesh → 5 named PBR after-views in del_dir."""
-    from partcraft.pipeline_v3.trellis2_3d import _render_after_named_views
+def _render_del_after_views(pipeline, p25_cfg, enc, del_dir, vname, logger):
+    """Decode the deleted latents → mesh → the ONE best-view PBR after-view in del_dir.
+    del/add don't run gate-E, so only the best_view (= before's selected view) is kept."""
+    from partcraft.render import ovox_views as _ov
+    from partcraft.pipeline_v3.trellis2_3d import _get_envmap
+    from PIL import Image
     del_dir.mkdir(parents=True, exist_ok=True)
+    for old in del_dir.glob("after_view_*.png"):   # drop stale multi-view renders
+        old.unlink()
     mesh = pipeline.decode_latent(
         _slat_from_arrays(enc["shape_feats"], enc["shape_coords"]),
         _slat_from_arrays(enc["tex_feats"], enc["tex_coords"]), 512)[0]
-    _render_after_named_views(mesh, del_dir, p25_cfg, logger)
+    env = _get_envmap(p25_cfg, logger)
+    res = int(p25_cfg.get("trellis2_gate_view_res", 512))
+    imgs = _ov.render_sample(mesh, view_names=[vname], envmap=env, resolution=res, bg=(1, 1, 1))
+    for name, rgb in imgs.items():
+        Image.fromarray(rgb).save(del_dir / f"after_view_{name}.png")
+    logger.info("[del_add] %s rendered after-view %s", del_dir.name, vname)
 
 
-def _copy_before_to_add_after_views(gate_dir: Path, add_dir: Path, logger):
+def _copy_before_to_add_after_views(gate_dir: Path, add_dir: Path, vname, logger):
     """addition's after == the ORIGINAL object, already rendered at encode as
-    gate_views/before_view_*.png — copy them to add_dir/after_view_*.png (no decode)."""
+    gate_views/before_view_<bv>.png — copy ONLY the best_view to add_dir/after_view_<bv>.png."""
     import shutil
     add_dir.mkdir(parents=True, exist_ok=True)
+    for old in add_dir.glob("after_view_*.png"):   # drop stale multi-view copies
+        old.unlink()
     n = 0
-    for v in VIEW_ORDER:
+    for v in (vname,):
         src = gate_dir / f"before_view_{v}.png"
         if src.is_file():
             shutil.copy2(src, add_dir / f"after_view_{v}.png")
@@ -384,7 +433,7 @@ def run(
     p25_cfg = psvc.trellis_image_edit_flat(cfg)
     canonical = bool(p25_cfg.get("trellis2_canonical_frame", False))
     render_after_views = bool(p25_cfg.get("trellis2_render_gate_views", True))
-    write_mask = bool(p25_cfg.get("del_add_write_mask", False))
+    write_mask = bool(p25_cfg.get("del_add_write_mask", True))   # mask.npz lives in prod
 
     # Lazy-load the GPU models only when the first object actually needs work, so
     # a full-resume shard (everything already encoded) loads nothing.
