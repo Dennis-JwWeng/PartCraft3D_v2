@@ -105,6 +105,21 @@ pipeline:
     steps:
     - gate_quality
 
+  - name: del_add
+    desc: >
+      v2-native deletion + inverse-addition latent re-encode at 512.  Per object:
+      reads phase1/parsed.json deletion specs (deletion is gate_a-deferred under
+      the mod/scale allow-list, so iter_deletion_specs skips it) → merges surviving
+      parts into a TEMP after_new.glb (NEVER persisted) → encodes shape+tex SLat
+      @512 in the ORIGINAL mesh frame → writes edits_3d/del_*/ and edits_3d/add_*/
+      latents/{shape_slat,tex_slat,ss}.npz uniformly with mod/scale, plus 5 named
+      after_view_*.png.  best_view = overview-pixel argmax (deletion has no VLM
+      best_view).  GPU stage; per-GPU round-robin object slicing via dispatch_gpus.
+    servers: none
+    use_gpus: true
+    steps:
+    - del_add
+
 services:
   vlm:
     model: /mnt/zsn/ckpts/Qwen3.6-27B

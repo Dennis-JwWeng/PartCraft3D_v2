@@ -80,14 +80,16 @@ ALL_STEPS = (
     "trellis2_3d",     # Step 5:  TRELLIS.2 image-driven regen → after.glb (GPU)
     # ── Final quality gate (all types) ───────────────────────────────
     "gate_quality",    # Gate E:  final VLM visual quality check
+    # ── Deletion + inverse-addition latent re-encode (GPU) ───────────
+    "del_add",         # v2-native del + inverse-add SLat re-encode → edits_3d/<id>/latents
     # ── Inactive ─────────────────────────────────────────────────────
-    # "reencode_del",  # Step 6b: Blender 40-view → SLAT enc → after.npz (GPU)
+    # "reencode_del",  # Step 6b: Blender 40-view → SLAT enc (v1 path, superseded by del_add)
 )
 
 # Steps that require multi-GPU subprocess dispatch via dispatch_gpus().
 # preview_del uses Blender (CPU-bound per call, parallelised by n_workers)
 # so it is NOT in GPU_STEPS.
-GPU_STEPS: frozenset[str] = frozenset({"trellis2_3d", "trellis2_encode"})
+GPU_STEPS: frozenset[str] = frozenset({"trellis2_3d", "trellis2_encode", "del_add"})
 
 
 # ─────────────────── config + ctx resolution ─────────────────────────
@@ -546,10 +548,22 @@ def run_step(
         s5v2_run(ctxs, cfg=cfg, images_root=images_root, mesh_root=mesh_root,
                  shard=shard, prereq_map=prereq_map, force=args.force, logger=log)
 
+    # ── del_add ───────────────────────────────────────────────────────────
+    # v2-native deletion + inverse-addition latent re-encode (GPU). Per object:
+    # reads phase1/parsed.json deletion specs (NOT iter_deletion_specs — deletion
+    # is gate_a-deferred on mod/scale shards), merges surviving parts into a TEMP
+    # after_new.glb (never persisted), encodes shape+tex SLat @512 in the original
+    # mesh frame, and writes del + inverse-add latents into edits_3d/<id>/latents/
+    # uniformly with mod/scale. best_view = overview-pixel argmax. Multi-GPU via
+    # dispatch_gpus (round-robin object slicing), same as trellis2_encode.
+    elif step == "del_add":
+        from .del_add_reencode import run as del_add_run
+        del_add_run(ctxs, cfg=cfg, images_root=images_root, mesh_root=mesh_root,
+                    shard=shard, prereq_map=prereq_map, force=args.force, logger=log)
+
     # ── reencode_del (inactive) ───────────────────────────────────────────
-    # GPU re-encode for deletion edits: Blender 40-view → DINOv2 →
-    # SLAT encoder → SS encoder → after.npz.
-    # Requires gate_e == pass. Not yet in default flow; uncomment to enable.
+    # v1 GPU re-encode for deletion edits: Blender 40-view → DINOv2 → SLAT/SS
+    # encoder → after.npz. Superseded by del_add (v2-native, in-process encode).
     # elif step == "reencode_del":
     #     from .mesh_deletion import link_slat_assets_batch
     #     blender = resolve_blender_executable(cfg)
@@ -1032,6 +1046,8 @@ _STATUS_KEYS: dict[str, str] = {
     "gate_2d":         "sq2_qc_C",
     "trellis2_encode": "s4b_t2_encode",
     "trellis2_3d":     "s5_trellis2",
+    # Deletion + inverse-addition latent re-encode
+    "del_add":         "s_del_add",
     # Inactive
     # "reencode_del":  "s6b_del_reencode",
 }
