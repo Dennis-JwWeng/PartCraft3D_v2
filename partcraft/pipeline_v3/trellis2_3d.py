@@ -269,9 +269,32 @@ def _sparse_to_np(st):
     return f, c3.detach().cpu().to(_t.int16).numpy()
 
 
+def _ss_latent_from_occ64(ss_enc, coords_new, dev):
+    """``ss_enc`` of the 64³ occupancy defined by ``[N,3]`` (or ``[N,4]``) int voxel
+    coords → np float32 ``[1,8,16,16,16]``.
+
+    BYTE-COMPATIBLE with the P1 ``ss.npz`` before-latent
+    (``trellis2_encode.encode_shape_tex_ss``): zero ``[1,1,64³]`` occupancy, set
+    active voxels to 1, run the SAME ``ss_enc`` (default
+    ``ss_enc_conv3d_16l8_fp16``).  Captured from the 64³ ``coords_new`` BEFORE the
+    ``_to_s2`` downsample so the after-latent describes the true 64³ structure —
+    the training target for the S1 (SS structure) stage."""
+    import torch as _t
+    import numpy as _np
+    c = coords_new.long()
+    if c.shape[1] == 4:
+        c = c[:, 1:]
+    c = c.to(dev)
+    occ = _t.zeros(1, 1, 64, 64, 64, device=dev)
+    occ[0, 0, c[:, 0], c[:, 1], c[:, 2]] = 1.0
+    with _t.no_grad():
+        z = ss_enc(occ.float())
+    return z.detach().cpu().numpy().astype(_np.float32)
+
+
 def _collect_edit_latents(*, edit_type, target_part_ids, coords0, coords_new,
                           shape_new, tex_new, edit_grid, keep16,
-                          s1_pad, s1_thresh):
+                          s1_pad, s1_thresh, ss_latent=None):
     """Gather the per-edit latents into plain numpy (for ``_save_edit_latents``)."""
     import numpy as _np
     import torch as _t
@@ -293,6 +316,9 @@ def _collect_edit_latents(*, edit_type, target_part_ids, coords0, coords_new,
         "edit_grid": eg,
         "keep16": (keep16.detach().cpu().numpy() if keep16 is not None else None),
         "s1_pad": s1_pad, "s1_thresh": s1_thresh,
+        # after SS latent (dense [1,8,16,16,16]) — S1 training target; None on
+        # S2-only edit types (structure unchanged → after == before).
+        "ss_latent": ss_latent,
     }
 
 
@@ -326,6 +352,12 @@ def _save_edit_latents(latents: dict, edit_dir: Path, logger):
         _np.savez_compressed(out / "tex_slat.npz",
                              feats=latents["tex_feats"],
                              coords=latents["tex_coords"])
+    # after SS latent (dense [1,8,16,16,16]) — the S1 stage's training target,
+    # ss_enc of the 64³ edited occupancy.  Named ``ss_latent.npz`` to disambiguate
+    # from ``ss.npz`` (the coords/region pack).  Byte-compatible with the P1
+    # before-latent ``p1_encode/ss.npz``.
+    if latents.get("ss_latent") is not None:
+        _np.savez_compressed(out / "ss_latent.npz", ss=latents["ss_latent"])
     logger.info(
         "[s5/P4] saved latents → %s (ss_new=%s shape=%s tex=%s)", out,
         None if latents["coords_new"] is None else latents["coords_new"].shape,
@@ -336,7 +368,7 @@ def _save_edit_latents(latents: dict, edit_dir: Path, logger):
 def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
                    mesh_npz_path, p25_cfg, logger, white_model=False,
                    p1_feats_s2=None, p1_coords_s2=None, p1_tex_s2=None,
-                   edit_res=1024):
+                   edit_res=1024, ss_latent_only=False):
     """Masked 3-layer edit → MeshWithVoxel (same shape as ``pipeline.run()[0]``).
 
     ``edit_res`` (1024 default / 512) sets the S2 SLat resolution.  S1 (the SS
@@ -381,6 +413,10 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
     sampler = MaskedFlowEulerGuidanceIntervalSampler(1e-5)
     edit_type = (getattr(spec, "edit_type", "") or "").lower()
     target_part_ids = list(getattr(spec, "selected_part_ids", []) or [])
+    if ss_latent_only and (edit_type not in S1_S2_TYPES or not target_part_ids):
+        # S2-only edit types (material/color/global) don't change structure →
+        # the after SS latent equals the before; nothing to re-encode here.
+        return None, {"ss_latent_only": True, "ss_latent": None}
     # S1 runs on the 64³ body; S2 on the grid-(edit_res) body (== 64³ for 1024).
     slat_grid = edit_res // 16
     factor = 64 // slat_grid
@@ -402,6 +438,7 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
     # keep16 / s1_* only exist on the S1 (structure-edit) path.
     edit_grid = keep16 = None
     s1_pad = s1_thresh = None
+    ss_after_latent = None   # after SS latent (dense [1,8,16,16,16]); set on the S1 path
     # canonical Z-up encode/mask frame (must match the P1 encode's flag)
     canonical = bool(p25_cfg.get("trellis2_canonical_frame", False))
 
@@ -630,6 +667,18 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
             logger.info("[s5/P4] %s S1 restore-preserved (64³ SS same-frame): "
                         "+%d voxels (%d → %d)", spec.edit_id, n_restored,
                         n_before, coords_new.shape[0])
+        # after SS latent (S1 training target): ss_enc of the TRUE 64³ edited
+        # occupancy, captured BEFORE the _to_s2 downsample.  Byte-compatible with
+        # the P1 before-latent (p1_encode/ss.npz).  In ss_latent_only (backfill)
+        # mode we stop here — S2 (shape/tex/decode/render) is skipped entirely.
+        ss_after_latent = _ss_latent_from_occ64(
+            t2s.get_ss_encoder(pipeline, p25_cfg, logger), coords_new, dev)
+        if ss_latent_only:
+            return None, {
+                "ss_latent_only": True,
+                "ss_latent": ss_after_latent,
+                "coords_new_64": coords_new.detach().cpu().to(torch.int16).numpy(),
+            }
         # ── S2 geometry on coords_new (downsampled 64³→slat_grid for 512) ──
         coords_new, edit_grid = _to_s2(coords_new, edit_grid)
         shape_new = t2e.masked_shape_slat(
@@ -685,7 +734,7 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
         coords0=coords0, coords_new=coords_new,
         shape_new=shape_new, tex_new=tex_new,
         edit_grid=edit_grid, keep16=keep16,
-        s1_pad=s1_pad, s1_thresh=s1_thresh)
+        s1_pad=s1_pad, s1_thresh=s1_thresh, ss_latent=ss_after_latent)
     return mesh, latents
 
 
@@ -771,6 +820,52 @@ def _render_before_named_views(pipeline, ctx, gate_dir: Path, p25_cfg: dict, log
 
 # ─────────────────── per-object processing ───────────────────────────
 
+def _finish_ss_latent_only(ctx, spec, pair_dir, latents, log) -> bool:
+    """Backfill writer: persist ss_latent.npz (+ mask.npz) for one edit, verify the
+    S1 re-run reproduced the original occupancy.  Returns False on hard failure."""
+    import numpy as _np
+    out = pair_dir / "latents"
+    ss_after = latents.get("ss_latent")
+    if ss_after is None:
+        log.warning("[s5/ss_latent] %s no after SS latent (S2-only type) — skip",
+                    spec.edit_id)
+        return False
+    _np.savez_compressed(out / "ss_latent.npz", ss=ss_after)
+
+    # consistency: downsample2(re-run coords_new@64³) vs saved ss.npz coords_new@32³.
+    # seed + cached edited image are fixed → S1 is deterministic → IoU should be 1.0.
+    iou = None
+    try:
+        saved = _np.load(out / "ss.npz", allow_pickle=True)
+        cn32_saved = {tuple(int(x) for x in c)
+                      for c in _np.asarray(saved["coords_new"]).tolist()}
+        cn64 = latents.get("coords_new_64")
+        cn32_re = {tuple(int(x) // 2 for x in c)
+                   for c in _np.asarray(cn64).tolist()}
+        inter = len(cn32_saved & cn32_re)
+        union = len(cn32_saved | cn32_re) or 1
+        iou = inter / union
+    except Exception as e:  # noqa: BLE001
+        log.warning("[s5/ss_latent] %s consistency check failed: %s",
+                    spec.edit_id, e)
+
+    # mask.npz: pure function of the existing ss.npz region pack (CPU).
+    try:
+        from partcraft.pipeline_v3.del_add_reencode import mask_from_ss
+        ss = _np.load(out / "ss.npz", allow_pickle=True)
+        _np.savez_compressed(out / "mask.npz", **mask_from_ss(ss))
+    except Exception as e:  # noqa: BLE001
+        log.warning("[s5/ss_latent] %s mask save failed: %s", spec.edit_id, e)
+
+    log.info("[s5/ss_latent] %s ss_latent%s + mask saved; coords IoU=%s",
+             spec.edit_id, tuple(ss_after.shape),
+             "n/a" if iou is None else f"{iou:.4f}")
+    update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s5_ss_latent",
+                      status="done",
+                      verdict={"coords_iou": iou} if iou is not None else None)
+    return True
+
+
 def run_for_object(
     ctx: ObjectContext,
     *,
@@ -786,10 +881,36 @@ def run_for_object(
     log = logger or logging.getLogger("pipeline_v3.trellis2")
     res = Trellis2Result(obj_id=ctx.obj_id)
 
+    # Backfill mode: re-run S1 ONLY on already-edited mod/scale edits to add the
+    # after SS latent (ss_latent.npz) + mask.npz, skipping S2/decode/render.
+    # Selects edits that PASSED gate-E (valid training data), HAVE latents/ss.npz,
+    # but LACK latents/ss_latent.npz.
+    ss_latent_only = bool(p25_cfg.get("trellis2_ss_latent_only", False))
+    _es_edits: dict = {}
+    if ss_latent_only:
+        from .edit_status_io import load_edit_status
+        _es_edits = (load_edit_status(ctx) or {}).get("edits", {}) or {}
+
     all_specs: list[EditSpec] = []
     pending: list[EditSpec] = []
     for spec in iter_flux_specs(ctx):
         all_specs.append(spec)
+        if ss_latent_only:
+            # only valid (gate-E pass) mod/scale edits are training data
+            st = (_es_edits.get(spec.edit_id) or {}).get("stages", {})
+            ge = (st.get("gate_e") or st.get("gate_quality") or {}).get("status")
+            if ge != "pass":
+                res.n_skip += 1
+                continue
+            ldir = ctx.edit_3d_dir(spec.edit_id) / "latents"
+            if not (ldir / "ss.npz").is_file():
+                res.n_skip += 1
+                continue
+            if (ldir / "ss_latent.npz").is_file() and not force:
+                res.n_skip += 1
+                continue
+            pending.append(spec)
+            continue
         if prereq_map is not None:
             if not edit_needs_step(ctx, spec.edit_id, "s5", prereq_map, force=force):
                 res.n_skip += 1
@@ -871,7 +992,7 @@ def run_for_object(
     # object (same PbrMeshRenderer + envmap + white bg as the per-edit "after"),
     # so gate-E sees one consistent render style.
     render_gate_views = bool(p25_cfg.get("trellis2_render_gate_views", False))
-    if render_gate_views:
+    if render_gate_views and not ss_latent_only:
         try:
             _render_before_named_views(pipeline, ctx, ctx.dir / "gate_views", p25_cfg, log)
         except Exception as e:
@@ -903,7 +1024,15 @@ def run_for_object(
                 p1_feats_s2=p1_feats_s2, p1_coords_s2=p1_coords_s2,
                 p1_tex_s2=p1_tex_s2,
                 edit_res=edit_res,
+                ss_latent_only=ss_latent_only,
             )
+            if ss_latent_only:
+                # S1-only backfill: write ss_latent.npz + mask.npz, verify the
+                # re-run reproduced the original occupancy, skip glb/render.
+                ok = _finish_ss_latent_only(ctx, spec, pair_dir, latents, log)
+                res.n_ok += 1 if ok else 0
+                res.n_fail += 0 if ok else 1
+                continue
             if bool(p25_cfg.get("trellis2_save_latents", True)):
                 try:
                     _save_edit_latents(latents, pair_dir, log)
@@ -970,12 +1099,16 @@ def run(
 
     pipeline = _ensure_pipeline(p25_cfg, log)
 
+    # Backfill mode re-runs S1 on edits that ALREADY finished s5, so the
+    # object-level "s5 done → skip" gate must NOT short-circuit it; let
+    # run_for_object's own per-edit ss_latent.npz selection decide.
+    ss_latent_only = bool(p25_cfg.get("trellis2_ss_latent_only", False))
+
     results: list[Trellis2Result] = []
     for ctx in list(ctxs):
         edit_ids = [sp.edit_id for sp in iter_flux_specs(ctx)]
-        if edit_ids and not force and not obj_needs_stage(
-            ctx, edit_ids, "s5", prereq_map, force=force
-        ):
+        if (not ss_latent_only and edit_ids and not force
+                and not obj_needs_stage(ctx, edit_ids, "s5", prereq_map, force=force)):
             results.append(Trellis2Result(ctx.obj_id))
             continue
         # Per-object guard: a single bad object (e.g. missing P1 encode
