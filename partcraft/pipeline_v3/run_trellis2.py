@@ -740,7 +740,7 @@ def dispatch_gpus(
     # respawn-safe WITHOUT quarantine because it saves its core latents BEFORE
     # the fragile auxiliary render — a respawn resumes and skip-dones the poison
     # object (its latent already on disk) instead of re-crashing on it.
-    isolate = (step in ("trellis2_3d", "trellis2_encode")
+    isolate = (step in ("trellis2_3d", "trellis2_encode", "del_add")
                and os.environ.get("TRELLIS2_ISOLATE_RESPAWN_DISABLE", "0") != "1")
 
     procs: list[dict] = []
@@ -808,11 +808,13 @@ def _supervise_respawn(
     (heartbeat marker stale past TRELLIS2_HANG_TIMEOUT_S).
 
     The respawned worker re-runs the SAME ``--gpu-shard i/n`` static slice and
-    skip-dones what's already on disk.  For ``trellis2_3d`` ``run()``'s
-    ``_IsolateState`` also quarantines the in-flight (poison) object so a poison
-    mesh costs one object + one pipeline reload, not the slice.  ``trellis2_encode``
-    needs no quarantine — it saves its core latents BEFORE the fragile render, so
-    the respawn simply skip-dones the poison object.  Bounded by
+    skip-dones what's already on disk.  Each step's ``run()`` uses
+    ``bad_mesh.InflightGuard``: it stamps the object it is about to process into
+    an in-flight marker, so a process-fatal SIGSEGV (o_voxel voxelizer / CuMesh
+    renderer on a degenerate mesh — uncatchable, and on encode it dies BEFORE any
+    latent is saved) leaves the culprit known.  On respawn the guard records that
+    object in the shared ``bad_meshes.jsonl`` registry and skips it, so a poison
+    mesh costs one object + one reload, not the slice.  Bounded by
     TRELLIS2_RESPAWN_MAX per worker; once exhausted the remaining slice is
     deferred to the next launch.
     """
@@ -821,11 +823,11 @@ def _supervise_respawn(
     max_respawn = int(os.environ.get("TRELLIS2_RESPAWN_MAX", "8"))
     hang_to = float(os.environ.get("TRELLIS2_HANG_TIMEOUT_S", "1200"))
     root = resolve_root(load_config(cfg_path))
-    idir = root.global_dir / "_s5_isolate"
+    idir = root.global_dir / "_inflight"          # bad_mesh.InflightGuard marker dir
     shard = normalize_shard(shard)   # match the worker's ctxs[0].shard heartbeat path
     for pr in procs:
         cvd = pr["env"].get("CUDA_VISIBLE_DEVICES", "x").replace(",", "_")
-        pr["hb"] = idir / f"{shard}_cvd{cvd}.inflight"
+        pr["hb"] = idir / f"{step}_{shard}_cvd{cvd}.inflight"
         pr["respawns"] = 0
         pr["done"] = False
     agg = 0

@@ -35,7 +35,7 @@ sys.path.insert(0, str(_ROOT))
 
 from .paths import ObjectContext
 from . import services_cfg as psvc
-from .status import update_step, STATUS_OK, STATUS_FAIL
+from .status import update_step, STATUS_OK, STATUS_FAIL, STATUS_SKIP
 
 
 SHAPE_ENC_NAME = "microsoft/TRELLIS.2-4B/ckpts/shape_enc_next_dc_f16c32_fp16"
@@ -368,9 +368,23 @@ def run(
     pipeline = None
     envmap = None
     t0 = time.time()
-    n_ok = n_fail = n_skip = 0
+    n_ok = n_fail = n_skip = n_bad = 0
     ctxs = list(ctxs)
+    # Bad-mesh registry: skip meshes already known to hard-crash a GPU step
+    # (process-fatal SIGSEGV in the o_voxel voxelizer / renderer — uncatchable).
+    # Under a respawn supervisor the in-flight guard also DETECTS new ones: the
+    # object stamped before a crash is recorded bad on the next respawn.
+    from . import bad_mesh as _bm
+    _root = ctxs[0].root if ctxs else None
+    bad_set = _bm.load_bad(_root) if _root else set()
+    guard = _bm.make_guard(_root, shard, "trellis2_encode", log) if _root else None
+    if guard is not None:
+        bad_set = guard.bad
     for ctx in ctxs:
+        if ctx.obj_id in bad_set:
+            n_bad += 1
+            update_step(ctx, "s4b_t2_encode", status=STATUS_SKIP, reason="bad_mesh")
+            continue
         # When render_overview is on, the object is only "done" once the named
         # source views (gate_views/before_view_*) exist — flux_2d loads these
         # instead of doing a concurrent on-the-fly render.  Check the views, NOT
@@ -393,6 +407,10 @@ def run(
                     cb = p25_cfg.get("trellis2_codebase", "/mnt/zsn/3dobject/TRELLIS.2")
                     hdri = p25_cfg.get("trellis2_hdri", f"{cb}/assets/hdri/forest.exr")
                     envmap = _ov.load_envmap(hdri)
+            # stamp the object in-flight BEFORE the crash-prone voxelize/render;
+            # if it hard-segfaults, the next respawn records it bad and skips it.
+            if guard is not None:
+                guard.beat(ctx.obj_id)
             _encode_one(ctx, encoders, p25_cfg, log, pipeline=pipeline,
                         envmap=envmap, force=force)
             n_ok += 1
@@ -402,9 +420,13 @@ def run(
             n_fail += 1
             update_step(ctx, "s4b_t2_encode", status=STATUS_FAIL,
                         error=str(e)[:200])
+        finally:
+            # object survived (ok or caught failure) → not the segfault culprit
+            if guard is not None:
+                guard.clear()
     log.info(
-        "[s4b] done: ok=%d fail=%d skip=%d wall=%.1fs",
-        n_ok, n_fail, n_skip, time.time() - t0,
+        "[s4b] done: ok=%d fail=%d skip=%d bad_mesh=%d wall=%.1fs",
+        n_ok, n_fail, n_skip, n_bad, time.time() - t0,
     )
 
 

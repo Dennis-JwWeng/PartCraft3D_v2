@@ -1124,71 +1124,8 @@ def run_for_object(
     return res
 
 
-# ─────────────────── subprocess-isolation: poison quarantine + heartbeat ──
-#
-# A CuMesh CUDA fault (or GPU CTX-SWITCH-TIMEOUT hang) on a degenerate "poison"
-# mesh permanently corrupts the worker process's CUDA context — it cannot be
-# caught in-process (the next CUDA call dies, or the process segfaults outright).
-# When a respawn supervisor manages this worker (dispatch_gpus, env
-# TRELLIS2_ISOLATE_RESPAWN=1) we record the in-flight object to a marker file
-# BEFORE processing it; on respawn we read that marker and quarantine the object
-# (it killed the previous incarnation), so the respawn doesn't die on it again.
-# The marker doubles as a heartbeat (its mtime) the supervisor reads to detect
-# hangs.  Net: one poison mesh costs one object + one pipeline reload, not the
-# whole 1/N slice.
-
-class _IsolateState:
-    def __init__(self, root, shard: str, log):
-        self.idir = root.global_dir / "_s5_isolate"
-        self.idir.mkdir(parents=True, exist_ok=True)
-        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "x").replace(",", "_")
-        self.inflight = self.idir / f"{shard}_cvd{cvd}.inflight"
-        self.poison_path = self.idir / f"{shard}.poison"
-        self.poison: set[str] = set()
-        # quarantine whatever killed our previous incarnation
-        if self.inflight.is_file():
-            bad = ""
-            try:
-                bad = self.inflight.read_text().strip()
-            except OSError:
-                pass
-            if bad:
-                try:
-                    with open(self.poison_path, "a") as fh:
-                        fh.write(bad + "\n")
-                except OSError:
-                    pass
-                log.error("[s5/isolate] quarantined poison object %s "
-                          "(killed previous worker) — skipping it", bad)
-            try:
-                self.inflight.unlink()
-            except OSError:
-                pass
-        if self.poison_path.is_file():
-            try:
-                self.poison = {ln.strip() for ln in
-                               self.poison_path.read_text().splitlines() if ln.strip()}
-            except OSError:
-                pass
-
-    def beat(self, obj_id: str) -> None:
-        try:
-            self.inflight.write_text(obj_id)
-        except OSError:
-            pass
-
-    def clear(self) -> None:
-        try:
-            self.inflight.unlink()
-        except OSError:
-            pass
-
-
-def _isolate_state(ctxs: list, shard: str, log):
-    """Active only under a respawn supervisor (TRELLIS2_ISOLATE_RESPAWN=1)."""
-    if os.environ.get("TRELLIS2_ISOLATE_RESPAWN", "0") != "1" or not ctxs:
-        return None
-    return _IsolateState(ctxs[0].root, shard, log)
+# Per-worker bad-mesh detection + the shared registry now live in bad_mesh.py
+# (used by every GPU step: trellis2_encode, trellis2_3d, del_add).
 
 
 # ─────────────────── batch entrypoint (single GPU) ───────────────────
@@ -1224,26 +1161,30 @@ def run(
     ss_latent_only = bool(p25_cfg.get("trellis2_ss_latent_only", False))
 
     ctxs = list(ctxs)
-    # Subprocess-isolation poison quarantine + heartbeat (no-op unless a respawn
-    # supervisor set TRELLIS2_ISOLATE_RESPAWN=1 — see dispatch_gpus).
-    iso = _isolate_state(ctxs, shard, log)
+    # Shared bad-mesh registry: skip meshes known to hard-crash any GPU step
+    # (process-fatal SIGSEGV in the o_voxel voxelizer / CuMesh renderer).  Under
+    # a respawn supervisor the in-flight guard also DETECTS new ones and records
+    # them, so one crash quarantines a mesh across all stages, for good.
+    from . import bad_mesh as _bm
+    _root = ctxs[0].root if ctxs else None
+    guard = _bm.make_guard(_root, shard, "trellis2_3d", log) if _root else None
+    bad = guard.bad if guard is not None else (_bm.load_bad(_root) if _root else set())
 
     results: list[Trellis2Result] = []
     for ctx in ctxs:
-        if iso is not None and ctx.obj_id in iso.poison:
-            log.warning("[s5/isolate] skipping quarantined poison object %s",
-                        ctx.obj_id)
-            results.append(Trellis2Result(ctx.obj_id, error="poison_quarantined"))
+        if ctx.obj_id in bad:
+            log.warning("[s5/badmesh] skipping known-bad mesh %s", ctx.obj_id)
+            results.append(Trellis2Result(ctx.obj_id, error="bad_mesh"))
             continue
         edit_ids = [sp.edit_id for sp in iter_flux_specs(ctx)]
         if (not ss_latent_only and edit_ids and not force
                 and not obj_needs_stage(ctx, edit_ids, "s5", prereq_map, force=force)):
             results.append(Trellis2Result(ctx.obj_id))
             continue
-        # Record this object as in-flight BEFORE touching the GPU: if a CuMesh
-        # CUDA fault hard-kills the process here, the respawn quarantines it.
-        if iso is not None:
-            iso.beat(ctx.obj_id)
+        # Stamp in-flight BEFORE touching the GPU: a process-fatal CUDA fault
+        # here is recorded bad + skipped by the next respawn.
+        if guard is not None:
+            guard.beat(ctx.obj_id)
         # Per-object guard: a single bad object (e.g. missing P1 encode
         # output from a segfaulted encode worker — FileNotFoundError in
         # _load_p1_slat) must NOT propagate to main() and kill this GPU
@@ -1270,9 +1211,9 @@ def run(
                         error=str(exc))
             results.append(Trellis2Result(ctx.obj_id, error=str(exc)))
         finally:
-            # Object survived (success or caught failure) → it is not poison.
-            if iso is not None:
-                iso.clear()
+            # Object survived (success or caught failure) → not the segfault culprit.
+            if guard is not None:
+                guard.clear()
     return results
 
 

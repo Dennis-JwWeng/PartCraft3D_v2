@@ -49,7 +49,7 @@ sys.path.insert(0, str(_ROOT))
 
 from .paths import ObjectContext
 from . import services_cfg as psvc
-from .status import update_step, STATUS_OK, STATUS_FAIL
+from .status import update_step, STATUS_OK, STATUS_FAIL, STATUS_SKIP
 from .edit_status_io import update_edit_stage, flush_edit_status
 
 from partcraft.render.ovox_views import VIEW_ORDER
@@ -441,15 +441,31 @@ def run(
     pipeline = None
 
     t0 = time.time()
-    n_del = n_add = n_fail = n_skip = 0
+    n_del = n_add = n_fail = n_skip = n_bad = 0
     results: list[DelAddResult] = []
-    for ctx in list(ctxs):
+    ctxs = list(ctxs)
+    # Shared bad-mesh registry: skip meshes known to hard-crash any GPU step
+    # (process-fatal SIGSEGV in o_voxel voxelizer / renderer).  Under a respawn
+    # supervisor the in-flight guard also detects + records new ones.
+    from . import bad_mesh as _bm
+    _root = ctxs[0].root if ctxs else None
+    guard = _bm.make_guard(_root, shard, "del_add", log) if _root else None
+    bad = guard.bad if guard is not None else (_bm.load_bad(_root) if _root else set())
+    for ctx in ctxs:
+        if ctx.obj_id in bad:
+            log.warning("[del_add/badmesh] skipping known-bad mesh %s", ctx.obj_id)
+            update_step(ctx, "s_del_add", status=STATUS_SKIP, reason="bad_mesh")
+            results.append(DelAddResult(ctx.obj_id, error="bad_mesh"))
+            n_bad += 1
+            continue
         try:
             if encoders is None and _object_has_pending(ctx, force):
                 encoders = _ensure_encoders(p25_cfg, log)
                 if render_after_views:
                     from partcraft.pipeline_v3.trellis2_3d import _ensure_pipeline
                     pipeline = _ensure_pipeline(p25_cfg, log)
+            if guard is not None:
+                guard.beat(ctx.obj_id)
             r = run_del_add_for_object(
                 ctx, encoders=encoders, pipeline=pipeline, p25_cfg=p25_cfg,
                 canonical=canonical, render_after_views=render_after_views,
@@ -458,6 +474,9 @@ def run(
             log.exception("[del_add] %s failed with unhandled error: %s", ctx.obj_id, exc)
             update_step(ctx, "s_del_add", status=STATUS_FAIL, error=str(exc)[:200])
             r = DelAddResult(ctx.obj_id, error=str(exc))
+        finally:
+            if guard is not None:
+                guard.clear()
         results.append(r)
         n_del += r.n_del; n_add += r.n_add; n_fail += r.n_fail; n_skip += r.n_skip
     flush_edit_status()
