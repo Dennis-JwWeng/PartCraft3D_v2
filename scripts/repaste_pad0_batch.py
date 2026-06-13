@@ -48,6 +48,11 @@ def main() -> None:
     ap.add_argument("--no-subtract-preserved", action="store_true")
     ap.add_argument("--res", type=int, default=512, help="render resolution")
     ap.add_argument("--slice", default="0/1", help="I/N object round-robin slice")
+    ap.add_argument("--edits-file", default="",
+                    help="optional filter: one '<obj_id>/<edit_id>' per line")
+    ap.add_argument("--out-root", default="",
+                    help="external output root → <out-root>/<obj_id>/<edit_id>/; "
+                         "default writes in-place under edits_3d/<id>/repaste_pad{P}")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
@@ -59,12 +64,25 @@ def main() -> None:
     import numpy as np
     import torch
 
+    from partcraft.pipeline_v3.del_add_reencode import mask_from_ss
     from partcraft.pipeline_v3.trellis2_part_mask import (
-        build_coord_bridge, downsample_edit_grid, part_edit_grid_64)
+        build_coord_bridge, downsample_edit_grid, edit_grid_64_to_keep16,
+        part_edit_grid_64)
     from partcraft.render.ovox_views import VIEW_ORDER
 
     EDIT_RES = 512
     GRID = EDIT_RES // 16          # 32
+
+    def _out_dir(od: Path, eid: str) -> Path:
+        if args.out_root:
+            return Path(args.out_root) / od.name / eid
+        return od / "edits_3d" / eid / f"repaste_pad{args.pad}"
+
+    edits_filter: set[str] | None = None
+    if args.edits_file:
+        edits_filter = {ln.strip() for ln in Path(args.edits_file).read_text().splitlines()
+                        if ln.strip()}
+        log.info("edits filter: %d entries from %s", len(edits_filter), args.edits_file)
 
     shard_dir = Path(args.root) / "objects" / args.shard
     obj_dirs = sorted(d for d in shard_dir.iterdir()
@@ -77,6 +95,8 @@ def main() -> None:
     for od in obj_dirs:
         es = json.loads((od / "edit_status.json").read_text())
         for eid, e in (es.get("edits") or {}).items():
+            if edits_filter is not None and f"{od.name}/{eid}" not in edits_filter:
+                continue
             stages = e.get("stages") or {}
             if (stages.get("gate_e") or {}).get("status") != "pass":
                 continue
@@ -89,7 +109,7 @@ def main() -> None:
                             od.name, eid)
                 continue
             view_name = VIEW_ORDER[bv]
-            out_dir = od / "edits_3d" / eid / f"repaste_pad{args.pad}"
+            out_dir = _out_dir(od, eid)
             if not args.force and (out_dir / f"after_view_{view_name}.png").is_file():
                 continue
             work.append((od, eid, view_name))
@@ -100,11 +120,15 @@ def main() -> None:
     from PIL import Image
     import trellis2.modules.sparse as sp
     from partcraft.pipeline_v3 import trellis2_3d as T
+    from partcraft.pipeline_v3 import trellis2_edit_stages as t2e
+    from partcraft.pipeline_v3.trellis2_masked_sampler import (
+        MaskedFlowEulerGuidanceIntervalSampler)
     from partcraft.render import ovox_views as ov
 
     pipeline = T._ensure_pipeline(
         {"trellis2_codebase": TRELLIS2_DIR, "trellis2_ckpt": args.ckpt}, log)
     env = ov.load_envmap(f"{TRELLIS2_DIR}/assets/hdri/forest.exr")
+    sampler = MaskedFlowEulerGuidanceIntervalSampler(1e-5)
 
     def _sparse(coords_np, feats_t):
         c = torch.from_numpy(np.asarray(coords_np)).int()
@@ -112,7 +136,7 @@ def main() -> None:
         return sp.SparseTensor(feats=feats_t.float().cuda(), coords=coords)
 
     n_done = n_err = 0
-    grid_cache: dict[tuple, "torch.Tensor"] = {}
+    grid_cache: dict[tuple, tuple] = {}   # (obj, parts) -> (grid32, grid64)
     t_start = time.time()
     for od, eid, view_name in work:
         t0 = time.time()
@@ -124,8 +148,11 @@ def main() -> None:
             parts = tuple(int(p) for p in ss["parts"])
             ashape = np.load(lat_dir / "shape_slat.npz")
             bshape = np.load(od / "p1_encode" / "shape_slat_e512.npz")
-            # white-model objects (phase1 visibility.json white_model=true) have
-            # NO tex latents by design — shape-only repaste + white decode.
+            btex = np.load(od / "p1_encode" / "tex_slat_e512.npz")
+            # white-model objects (legacy runs flagged via phase1
+            # visibility.json) have NO after tex latent — the S2 tex stage was
+            # skipped.  Backfill it below: free-gen + pad-P paste; the P1
+            # before-tex encode always exists.
             white = not (lat_dir / "tex_slat.npz").is_file()
             if white:
                 vis = od / "phase1" / "visibility.json"
@@ -135,9 +162,13 @@ def main() -> None:
                                 "skipped", od.name, eid)
                     n_err += 1
                     continue
+                if btex["feats"].shape[0] != coords0.shape[0]:
+                    log.warning("%s/%s: before-tex rows mismatch — skipped",
+                                od.name, eid)
+                    n_err += 1
+                    continue
             else:
                 atex = np.load(lat_dir / "tex_slat.npz")
-                btex = np.load(od / "p1_encode" / "tex_slat_e512.npz")
             if (bshape["feats"].shape[0] != coords0.shape[0]
                     or ashape["feats"].shape[0] != coords_new.shape[0]):
                 log.warning("%s/%s: row mismatch — skipped", od.name, eid)
@@ -145,30 +176,51 @@ def main() -> None:
                 continue
 
             key = (od.name, parts)
-            grid32 = grid_cache.get(key)
-            if grid32 is None:
+            cached = grid_cache.get(key)
+            if cached is None:
                 mesh_npz = Path(args.mesh_root) / args.shard / f"{od.name}.npz"
                 grid64 = part_edit_grid_64(
                     mesh_npz, list(parts), pad=args.pad, canonical=True,
                     subtract_preserved=not args.no_subtract_preserved)
                 grid32 = downsample_edit_grid(grid64, 64 // GRID).cuda()
-                grid_cache[key] = grid32
+                cached = (grid32, grid64.cuda())
+                grid_cache[key] = cached
+            grid32, grid64 = cached
             preserved, src_idx = build_coord_bridge(
                 coords0.cuda(), coords_new.cuda(), grid32, grid=GRID)
 
             sh = torch.from_numpy(ashape["feats"]).float().cuda()
             sh[preserved] = torch.from_numpy(bshape["feats"]).float().cuda()[src_idx]
 
-            out_dir = od / "edits_3d" / eid / f"repaste_pad{args.pad}"
+            out_dir = _out_dir(od, eid)
             out_dir.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(out_dir / "shape_slat.npz",
                                 feats=sh.cpu().numpy(), coords=ss["coords_new"])
             if white:
-                from partcraft.pipeline_v3.trellis2_white import (
-                    build_white_model_mesh)
-                mesh = build_white_model_mesh(
-                    pipeline, _sparse(ashape["coords"], sh.cpu()),
-                    log, res=EDIT_RES)
+                # tex backfill: free-generate the tex SLat under the FLUX
+                # edited image + repaired shape; masked_tex_slat does the
+                # pad-P paste of the P1-encoded before tex internally
+                # (anchor_mode=posthoc — the prod recipe, smaller grid).
+                # cond_orig is unused on the restore path → edited cond twice.
+                edited_p = od / "edits_2d" / f"{eid}_edited.png"
+                cond_edit = pipeline.get_cond(
+                    [pipeline.preprocess_image(
+                        Image.open(edited_p).convert("RGB"))], EDIT_RES)
+                shape_new_sp = _sparse(ashape["coords"], sh.cpu())
+                shape0_sp = _sparse(ss["coords0"],
+                                    torch.from_numpy(bshape["feats"]))
+                tex_sp = t2e.masked_tex_slat(
+                    pipeline, sampler, shape0_sp, shape_new_sp,
+                    coords0.int().cuda(), coords_new.int().cuda(), grid32,
+                    cond_edit, cond_edit, log, anchor_mode="posthoc",
+                    res=EDIT_RES,
+                    before_tex_denorm=torch.from_numpy(
+                        btex["feats"]).float().cuda())
+                np.savez_compressed(out_dir / "tex_slat.npz",
+                                    feats=tex_sp.feats.cpu().numpy(),
+                                    coords=ss["coords_new"])
+                mesh = pipeline.decode_latent(shape_new_sp, tex_sp,
+                                              EDIT_RES)[0]
             else:
                 tx = torch.from_numpy(atex["feats"]).float().cuda()
                 tx[preserved] = torch.from_numpy(btex["feats"]).float().cuda()[src_idx]
@@ -180,12 +232,27 @@ def main() -> None:
             mesh.simplify(16_777_216)
             imgs = ov.render_sample(mesh, view_names=[view_name], envmap=env,
                                     resolution=args.res, bg=(1, 1, 1))
+            # pad-P ss.npz: prod fields with edit_grid/keep16 rebuilt at this
+            # pad; s1_pad stays the S1 run pad (occupancy is untouched).
+            thresh = float(ss["s1_thresh"]) if "s1_thresh" in ss.files else 0.1
+            ss_out = {k: ss[k] for k in ss.files
+                      if k not in ("edit_grid", "keep16")}
+            ss_out["edit_grid"] = (torch.nonzero(grid32).cpu()
+                                   .to(torch.int16).numpy())
+            ss_out["keep16"] = (edit_grid_64_to_keep16(grid64, thresh)
+                                .cpu().numpy())
+            ss_out["repaste_pad"] = np.int32(args.pad)
+            np.savez_compressed(out_dir / "ss.npz", **ss_out)
+            np.savez_compressed(out_dir / "mask.npz", **mask_from_ss(ss_out))
             (out_dir / "meta.json").write_text(json.dumps({
                 "edit_id": eid, "parts": list(parts),
-                "repaste_pad": args.pad, "view_name": view_name,
+                "repaste_pad": args.pad,
+                "s1_run_pad": int(ss["s1_pad"]) if "s1_pad" in ss.files else None,
+                "view_name": view_name,
                 "tokens_total": int(coords_new.shape[0]),
                 "preserved": int(preserved.sum()),
                 "white_model": white,
+                "white_tex_generated": white,
             }, indent=2))
             # PNG last — it is the sentinel, so a crash mid-edit re-runs cleanly
             Image.fromarray(imgs[view_name]).save(

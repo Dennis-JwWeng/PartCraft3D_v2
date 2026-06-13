@@ -121,7 +121,8 @@ def _full_center_scale_np(mesh_npz: Path):
     import io as _io
     import numpy as _np
     import trimesh
-    d = _np.load(str(mesh_npz), allow_pickle=True)
+    from scripts.data_prep.mesh_sources import open_mesh
+    d = open_mesh(mesh_npz)
     g = trimesh.load(_io.BytesIO(d["full.glb"].tobytes()),
                      file_type="glb", process=False)
     if isinstance(g, trimesh.Scene):
@@ -363,6 +364,56 @@ def _save_edit_latents(latents: dict, edit_dir: Path, logger):
         None if latents["coords_new"] is None else latents["coords_new"].shape,
         None if latents["shape_feats"] is None else latents["shape_feats"].shape,
         None if latents["tex_feats"] is None else latents["tex_feats"].shape)
+
+
+def _repaste_s2_preserved(
+    p25_cfg, *, edit_type, target_part_ids, mesh_npz_path, canonical,
+    contact_soft, coords0, coords_new, edit_grid, factor, edit_res, s1_pad,
+    shape_new, tex_new, p1_feats_s2, p1_tex_s2, dev, logger,
+):
+    """Inline S2 latent re-paste at a SEPARATE pad — mirrors
+    ``scripts/repaste_pad0_batch.py`` done in-pipeline.
+
+    Re-defines the preserved (body) region at ``trellis2_s2_repaste_pad`` (a
+    usually-smaller pad than S1's) and HARD-PASTES the BEFORE-encoded body
+    shape/tex latents there, on top of the S1-pad-generated S2 latents — so the
+    body keeps its exact original material/shape tokens up to a tighter boundary.
+
+    Returns the SLAT-dim ``edit_grid`` to SAVE (rebuilt at the repaste pad → the
+    ``mask_from_ss`` SLAT mask becomes pad-P).  S1 is left untouched: occupancy
+    (``coords_new``) and the 16³ ``keep16`` mask keep ``pad=s1_pad``.
+
+    No-op (returns ``edit_grid`` unchanged) unless the config sets a repaste pad
+    that differs from ``s1_pad`` and the edit is a real structure edit with parts.
+    """
+    from partcraft.edit_types import S1_S2_TYPES
+    rp = p25_cfg.get("trellis2_s2_repaste_pad", None)
+    if (rp is None or edit_type not in S1_S2_TYPES or not target_part_ids
+            or s1_pad is None or int(rp) == int(s1_pad)):
+        return edit_grid
+    import torch as _t
+    from .trellis2_part_mask import (
+        part_edit_grid_64, downsample_edit_grid, build_coord_bridge)
+    rp = int(rp)
+    sub_pres = bool(p25_cfg.get("trellis2_mask_subtract_preserved", contact_soft))
+    grid64 = part_edit_grid_64(
+        mesh_npz_path, list(target_part_ids), pad=rp, canonical=canonical,
+        subtract_preserved=sub_pres).to(dev)
+    grid32 = downsample_edit_grid(grid64, factor).to(dev) if factor > 1 else grid64
+    preserved, src_idx = build_coord_bridge(
+        coords0.to(dev), coords_new.to(dev), grid32, grid=edit_res // 16)
+    preserved, src_idx = preserved.to(dev), src_idx.to(dev)
+    n_pre = int(preserved.sum())
+    # p1_feats_s2 / p1_tex_s2 are loaded on CPU (_load_p1_slat → from_numpy); move
+    # them to the SLat feats' device before indexing with the (cuda) src_idx.
+    _fdev = shape_new.feats.device
+    shape_new.feats[preserved] = p1_feats_s2.to(_fdev)[src_idx].to(shape_new.feats.dtype)
+    if tex_new is not None and p1_tex_s2 is not None:
+        tex_new.feats[preserved] = (
+            p1_tex_s2.to(tex_new.feats.device)[src_idx].to(tex_new.feats.dtype))
+    logger.info("[s5/P4] S2 repaste pad=%d (S1 pad=%s): %d body tokens hard-pasted "
+                "→ SLAT mask=pad%d, keep16 stays pad%s", rp, s1_pad, n_pre, rp, s1_pad)
+    return grid32
 
 
 def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
@@ -709,6 +760,11 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
                     spec.edit_id, edit_type, coords0.shape[0])
 
     # ── material + decode ─────────────────────────────────────────────
+    # save_edit_grid = the SLAT-dim edit_grid actually written to ss.npz.  The
+    # optional S2 re-paste (trellis2_s2_repaste_pad) rebuilds it at a separate
+    # (tighter) pad after hard-pasting the before-encoded body latents; defaults
+    # to the S1-pad edit_grid.  keep16 (16³ S1 mask) always stays at s1_pad.
+    save_edit_grid = edit_grid
     tex_new = None
     if white_model:
         from partcraft.pipeline_v3.trellis2_white import build_white_model_mesh
@@ -724,6 +780,15 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
             contact_sigma=s2_sigma_eff, res=edit_res,
             before_tex_denorm=p1_tex_s2)
         torch.cuda.empty_cache()
+        # Re-paste the preserved body shape+tex at the repaste pad BEFORE decode,
+        # so the decoded mesh (and the gate-E render) reflect the saved latents.
+        save_edit_grid = _repaste_s2_preserved(
+            p25_cfg, edit_type=edit_type, target_part_ids=target_part_ids,
+            mesh_npz_path=mesh_npz_path, canonical=canonical,
+            contact_soft=contact_soft, coords0=coords0, coords_new=coords_new,
+            edit_grid=edit_grid, factor=factor, edit_res=edit_res, s1_pad=s1_pad,
+            shape_new=shape_new, tex_new=tex_new,
+            p1_feats_s2=p1_feats_s2, p1_tex_s2=p1_tex_s2, dev=dev, logger=logger)
         meshes = pipeline.decode_latent(shape_new, tex_new, edit_res)
         mesh = meshes[0]
     mesh.simplify(16_777_216)
@@ -733,7 +798,7 @@ def _build_p4_mesh(pipeline, spec, edited_img, orig_img, p1_feats, p1_coords3,
         edit_type=edit_type, target_part_ids=target_part_ids,
         coords0=coords0, coords_new=coords_new,
         shape_new=shape_new, tex_new=tex_new,
-        edit_grid=edit_grid, keep16=keep16,
+        edit_grid=save_edit_grid, keep16=keep16,
         s1_pad=s1_pad, s1_thresh=s1_thresh, ss_latent=ss_after_latent)
     return mesh, latents
 
@@ -870,7 +935,6 @@ def run_for_object(
     ctx: ObjectContext,
     *,
     pipeline,
-    dataset,
     p25_cfg: dict,
     seed: int = 1,
     debug: bool = False,
@@ -934,14 +998,6 @@ def run_for_object(
                     n=res.n_skip, n_skip=res.n_skip)
         return res
 
-    try:
-        obj_record = dataset.load_object(ctx.shard, ctx.obj_id)
-    except Exception as e:
-        log.error("[s5] %s load_object failed: %s", ctx.obj_id, e)
-        update_step(ctx, "s5_trellis2", status=STATUS_FAIL,
-                    error=f"load_object: {e}")
-        res.error = str(e); res.n_fail = len(pending); return res
-
     # emit_glb=False → skip the HEAVY to_glb export (remesh + decimate + 4096²
     # texture bake + webp).  The edit stage then only decodes the latents and
     # renders the named gate views from them (PbrMeshRenderer) — fully
@@ -976,13 +1032,12 @@ def run_for_object(
         p1_tex_s2, _ = _load_p1_slat(ctx, res=edit_res, which="tex")
     except FileNotFoundError:
         p1_tex_s2 = None
-    from partcraft.pipeline_v3.trellis2_white import read_white_model_flag
-    # Phase-1 may flag an object as an untextured white model; the
-    # trellis2_force_white_model config knob forces it for ALL objects
-    # (shape-only experiments: stop after S2 shape, decode a grey 512 mesh,
-    # skip the texture SLat stage).
-    white_model = (read_white_model_flag(ctx)
-                   or bool(p25_cfg.get("trellis2_force_white_model", False)))
+    # white-model AUTO-detection removed: the texture stage now ALWAYS runs,
+    # even for visually colorless objects (phase1 visibility.json white_model
+    # is ignored — every edit must ship a tex latent).  Only the explicit
+    # trellis2_force_white_model config knob still skips it (shape-only
+    # experiments: stop after S2 shape, decode a grey 512 mesh).
+    white_model = bool(p25_cfg.get("trellis2_force_white_model", False))
     log.info("[s5/P4] %s loaded P1 SLat (S1 %d tok @64³, S2 %d tok @%d³)  "
              "edit_res=%d white_model=%s", ctx.obj_id,
              int(p1_coords3.shape[0]), int(p1_coords_s2.shape[0]),
@@ -1060,7 +1115,6 @@ def run_for_object(
             update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s5",
                               status="error", reason=str(e)[:200])
 
-    obj_record.close()
     update_step(
         ctx, "s5_trellis2",
         status=STATUS_OK if res.n_fail == 0 else STATUS_FAIL,
@@ -1068,6 +1122,73 @@ def run_for_object(
         wall_s=round(time.time() - t0, 2),
     )
     return res
+
+
+# ─────────────────── subprocess-isolation: poison quarantine + heartbeat ──
+#
+# A CuMesh CUDA fault (or GPU CTX-SWITCH-TIMEOUT hang) on a degenerate "poison"
+# mesh permanently corrupts the worker process's CUDA context — it cannot be
+# caught in-process (the next CUDA call dies, or the process segfaults outright).
+# When a respawn supervisor manages this worker (dispatch_gpus, env
+# TRELLIS2_ISOLATE_RESPAWN=1) we record the in-flight object to a marker file
+# BEFORE processing it; on respawn we read that marker and quarantine the object
+# (it killed the previous incarnation), so the respawn doesn't die on it again.
+# The marker doubles as a heartbeat (its mtime) the supervisor reads to detect
+# hangs.  Net: one poison mesh costs one object + one pipeline reload, not the
+# whole 1/N slice.
+
+class _IsolateState:
+    def __init__(self, root, shard: str, log):
+        self.idir = root.global_dir / "_s5_isolate"
+        self.idir.mkdir(parents=True, exist_ok=True)
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "x").replace(",", "_")
+        self.inflight = self.idir / f"{shard}_cvd{cvd}.inflight"
+        self.poison_path = self.idir / f"{shard}.poison"
+        self.poison: set[str] = set()
+        # quarantine whatever killed our previous incarnation
+        if self.inflight.is_file():
+            bad = ""
+            try:
+                bad = self.inflight.read_text().strip()
+            except OSError:
+                pass
+            if bad:
+                try:
+                    with open(self.poison_path, "a") as fh:
+                        fh.write(bad + "\n")
+                except OSError:
+                    pass
+                log.error("[s5/isolate] quarantined poison object %s "
+                          "(killed previous worker) — skipping it", bad)
+            try:
+                self.inflight.unlink()
+            except OSError:
+                pass
+        if self.poison_path.is_file():
+            try:
+                self.poison = {ln.strip() for ln in
+                               self.poison_path.read_text().splitlines() if ln.strip()}
+            except OSError:
+                pass
+
+    def beat(self, obj_id: str) -> None:
+        try:
+            self.inflight.write_text(obj_id)
+        except OSError:
+            pass
+
+    def clear(self) -> None:
+        try:
+            self.inflight.unlink()
+        except OSError:
+            pass
+
+
+def _isolate_state(ctxs: list, shard: str, log):
+    """Active only under a respawn supervisor (TRELLIS2_ISOLATE_RESPAWN=1)."""
+    if os.environ.get("TRELLIS2_ISOLATE_RESPAWN", "0") != "1" or not ctxs:
+        return None
+    return _IsolateState(ctxs[0].root, shard, log)
 
 
 # ─────────────────── batch entrypoint (single GPU) ───────────────────
@@ -1094,9 +1215,7 @@ def run(
     # _ensure_pipeline / _export_edit_glb.
     p25_cfg = psvc.trellis_image_edit_flat(cfg)
 
-    from partcraft.io.hy3d_loader import HY3DPartDataset
-    dataset = HY3DPartDataset(str(images_root), str(mesh_root), [shard])
-
+    # Uses ctx.mesh_npz + edits_2d PNGs + P1 latents only (no images NPZ).
     pipeline = _ensure_pipeline(p25_cfg, log)
 
     # Backfill mode re-runs S1 on edits that ALREADY finished s5, so the
@@ -1104,13 +1223,27 @@ def run(
     # run_for_object's own per-edit ss_latent.npz selection decide.
     ss_latent_only = bool(p25_cfg.get("trellis2_ss_latent_only", False))
 
+    ctxs = list(ctxs)
+    # Subprocess-isolation poison quarantine + heartbeat (no-op unless a respawn
+    # supervisor set TRELLIS2_ISOLATE_RESPAWN=1 — see dispatch_gpus).
+    iso = _isolate_state(ctxs, shard, log)
+
     results: list[Trellis2Result] = []
-    for ctx in list(ctxs):
+    for ctx in ctxs:
+        if iso is not None and ctx.obj_id in iso.poison:
+            log.warning("[s5/isolate] skipping quarantined poison object %s",
+                        ctx.obj_id)
+            results.append(Trellis2Result(ctx.obj_id, error="poison_quarantined"))
+            continue
         edit_ids = [sp.edit_id for sp in iter_flux_specs(ctx)]
         if (not ss_latent_only and edit_ids and not force
                 and not obj_needs_stage(ctx, edit_ids, "s5", prereq_map, force=force)):
             results.append(Trellis2Result(ctx.obj_id))
             continue
+        # Record this object as in-flight BEFORE touching the GPU: if a CuMesh
+        # CUDA fault hard-kills the process here, the respawn quarantines it.
+        if iso is not None:
+            iso.beat(ctx.obj_id)
         # Per-object guard: a single bad object (e.g. missing P1 encode
         # output from a segfaulted encode worker — FileNotFoundError in
         # _load_p1_slat) must NOT propagate to main() and kill this GPU
@@ -1118,7 +1251,7 @@ def run(
         # Record the failure and continue to the next object.
         try:
             results.append(run_for_object(
-                ctx, pipeline=pipeline, dataset=dataset, p25_cfg=p25_cfg,
+                ctx, pipeline=pipeline, p25_cfg=p25_cfg,
                 seed=seed, debug=debug,
                 prereq_map=prereq_map, force=force, logger=log,
             ))
@@ -1136,6 +1269,10 @@ def run(
             update_step(ctx, "s5_trellis2", status=STATUS_FAIL,
                         error=str(exc))
             results.append(Trellis2Result(ctx.obj_id, error=str(exc)))
+        finally:
+            # Object survived (success or caught failure) → it is not poison.
+            if iso is not None:
+                iso.clear()
     return results
 
 

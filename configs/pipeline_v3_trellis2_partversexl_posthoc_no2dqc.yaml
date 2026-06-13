@@ -1,33 +1,44 @@
 # =====================================================================
-# Pipeline v3 — POSTHOC (shape+tex), NO 2D QC  (512, pad4)  *** PARALLEL to canonical ***
+# PartVerse XL — POSTHOC (shape+tex), NO 2D QC  (512, pad4)
 # =====================================================================
-# Sibling of pipeline_v3_trellis2_t1ss_native_r512_pad4_texrestore.yaml (the
-# canonical config).  Two deliberate differences from canonical:
+# Flow-aligned sibling of
+#   pipeline_v3_trellis2_t1ss_native_r512_pad4_posthoc_no2dqc.yaml
+# Same stage topology + Trellis2 knobs; only data paths differ (XL mesh-only
+# pack — no prerender img_Enc / images NPZ required).
 #
-#   1. S2 SHAPE uses POSTHOC-RESTORE (trellis2_s2_anchor_mode: posthoc) instead
-#      of perstep — free generation under the edited image (edited part decodes
-#      SOLID, not a holey see-through shell), then HARD-PASTE the P1-encoded
-#      ORIGINAL body shape latent (shape_slat_e512.npz) onto preserved tokens
-#      (exact body, the shape twin of the tex restore).  This SKIPS the shape
-#      flow inversion (invert_clean) → ~1.22x/edit faster, edited part more solid.
-#   2. NO 2D QC: the gate_2d (Gate C) stage is removed.  trellis2_3d then gates
-#      on gate_a (text-align) only — every FLUX 2D edit reaches the 3D edit.
+# Stage order (identical to native posthoc_no2dqc):
+#   trellis2_encode → gen_edits+gate_a → flux_2d → trellis2_3d → gate_quality
+#   → del_add
 #
-# Both S2 stages now do ZERO flow inversion:
-#   * SHAPE   posthoc → invert_clean skipped (partcraft/pipeline_v3/trellis2_edit_stages.py).
-#   * TEXTURE posthoc-RESTORE (trellis2_s2_tex_anchor_mode: posthoc + restore_preserved)
-#     → free gen + hard-paste tex_slat_e512.npz; already NO inversion (never re-samples a reference).
+# Active edit types (qc.edit_types): modification + scale only.
+#   * flux_2d / trellis2_3d / Gate E (first pass) run on mod/scl only.
+#   * deletion + inverse-addition are gate_a-deferred during gen; del_add reads
+#     phase1/parsed.json deletion specs and writes edits_3d/del_*/ + add_*/
+#     latents + 5 named after_view_*.png in the same frame as mod/scl.
+# Gate E scope (qc.gate_quality_types): modification + scale — matches the
+# native first-pass judge (before del_add).  Do NOT judge addition here; re-run
+# gate_quality with QC_ONLY_TYPES=addition after del_add if needed.
 #
-# S1 = TRELLIS.1's SS flow + DINOv2 cond IN-PROCESS (trellis2_s1_ss_model: t1) —
-#      masked edit_grid, pad=4 dilation + same-frame 64³ restore_preserved.
-# edit_res=512, NO white-model → fully textured 512 mesh.  GLB OFF by default.
+# Full ss_latent + mask are written inline during trellis2_3d / del_add
+# (trellis2_save_latents: true).  Do NOT set trellis2_ss_latent_only.
 #
-# OUTPUT: data/Pxform_v2/prod_posthoc_no2dqc/objects/<shard>/<obj_id>/{...}.
+# Inputs: NO PACK.  The pipeline reads the raw XL layout directly
+#   (meshes/textured_part_glbs/<uuid>/*.glb + captions/<uuid>/caption.json) via
+#   data.source: partversexl_raw.  Nothing to pre-process; just run a shard.
+#   (scripts/data_prep/partverse/pack_npz_xl.py is now only for the legacy
+#    packed-NPZ path and is not needed here.)
 #
-# Run ONE shard end-to-end (encode→VLM gen+gate_a→FLUX→3D edit→Gate-E; NO gate_2d):
-#   SHARD=08 MACHINE_ENV=configs/machine/local_trellis2.env PIPELINE_GPUS="0,1,2,3,4,5,6,7" \
-#     bash run_pipeline_v3_shard_trellis2.sh posthoc_shard08 \
-#          configs/pipeline_v3_trellis2_t1ss_native_r512_pad4_posthoc_no2dqc.yaml
+# Run ONE shard end-to-end:
+#   SHARD=00 MACHINE_ENV=configs/machine/local_trellis2.env PIPELINE_GPUS="0,1" \
+#     bash run_pipeline_v3_shard_trellis2.sh xl_shard00 \
+#       configs/pipeline_v3_trellis2_partversexl_posthoc_no2dqc.yaml
+#
+# 10-object smoke:
+#   PIPELINE_GPUS="0,1" SHARD=00 \
+#   OBJ_IDS_FILE=configs/partversexl_smoke_10_shard00.txt \
+#   MACHINE_ENV=configs/machine/local_trellis2.env \
+#     bash run_pipeline_v3_shard_trellis2.sh xl_smoke10 \
+#       configs/pipeline_v3_trellis2_partversexl_posthoc_no2dqc.yaml
 #
 #   STAGES=<subset>   limit stages (e.g. STAGES=trellis2_preview,gate_quality)
 #   OBJ_IDS_FILE=...  limit to listed object ids   |   FORCE=1  re-run done steps
@@ -37,12 +48,20 @@ blender: /mnt/zsn/zsn_workspace/VoxHammer/third_party/blender-4.2.19-linux-x64/b
 ckpt_root: /mnt/zsn/ckpts/TRELLIS.2-4B
 
 data:
-  output_dir: data/Pxform_v2/prod_posthoc_no2dqc   # parallel prod tree (shape+tex posthoc, no gate_2d)
-  mesh_root:   data/partverse/inputs/mesh
-  images_root: data/partverse/inputs/images
+  # Raw PartVerse XL source — read STRAIGHT from meshes/textured_part_glbs +
+  # captions, NO pack / no per-object NPZ (scripts/data_prep/mesh_sources.py
+  # RawXLSource).  full.glb is assembled in-memory on first access (same
+  # assembler the pack used → byte-identical), part_N.glb served from raw bytes,
+  # part_captions.json derived from captions/<uuid>/caption.json.  Part labels
+  # therefore come from CAPTIONS (not anno_info).  Sharding is a pure runtime
+  # partition of the (textured ∩ captioned) id list — no data moves on disk.
+  source:     partversexl_raw
+  xl_root:    /mnt/zsn/data/partversexl
+  num_shards: 10
+  output_dir: data/Pxform_v2/partversexl_posthoc_no2dqc
 
 pipeline:
-  gpus: [0, 1, 2, 3, 4, 5, 6, 7]   # all 8 GPUs → 8-way parallel 3D edit
+  gpus: [0, 1]
 
   vlm_port_base: 8200
   vlm_port_stride: 1
@@ -100,7 +119,8 @@ pipeline:
       produced by trellis2_preview (gate_views/before_view_*,
       edits_3d/<id>/after_view_*, both PbrMeshRenderer white bg), builds the
       2x5 before/after collage and scores each edit; writes gate_e pass/fail to
-      edit_status.json / qc.json.  Own VLM batch after the 3D-edit chain.
+      edit_status.json.  Scoped to qc.gate_quality_types (mod/scale).  Own VLM
+      batch after the 3D-edit chain, before del_add.
     servers: vlm
     steps:
     - gate_quality
@@ -151,8 +171,14 @@ services:
                                             #   original tex latent (tex_slat_e512.npz) onto preserved tokens
                                             #   (auto-engaged because the encoded before-tex sidecar exists);
                                             #   already does NO flow inversion → preserved region = EXACT material
-    # ── 512 + pad4 + restore + FULL texture (no white-model) ──
-    trellis2_s1_pad: 4                      # Chebyshev box-dilate the 64³ edit grid by 4
+    # ── 512 + pad4 (S1) + pad2 (S2 re-paste) + restore + FULL texture ──
+    trellis2_s1_pad: 4                      # S1: Chebyshev box-dilate the 64³ edit grid by 4 (mask + diffusion + keep16)
+    # S2 latent re-paste: after S1-pad generation, re-define the preserved body
+    # region at THIS (tighter) pad and hard-paste the BEFORE-encoded shape+tex
+    # body latents there, then decode (inline port of scripts/repaste_pad0_batch.py).
+    # → SLAT-dim training mask (mask_keep_slat / ss.npz edit_grid) becomes pad2;
+    #   S1 stays pad4: occupancy + keep16 (mask_keep_ss) unchanged.  Unset = off.
+    trellis2_s2_repaste_pad: 2
     trellis2_s2_restore_preserved: true     # re-insert source body voxels S1 dropped outside the mask
     # force_white_model OFF → S2 texture (masked_tex_slat, posthoc-restore) runs → textured 512 mesh decode
 
@@ -162,6 +188,7 @@ services:
     emit_before: true
 
     trellis2_emit_glb: false   # GLB not needed — skip the heavy 4096² texture-bake-to-GLB; keep latents + after-views
+    trellis2_save_latents: true  # inline ss_latent + mask during trellis2_3d / del_add (XL training export)
 
     trellis2_render_gate_views: true
     trellis2_gate_view_res: 512
@@ -176,10 +203,12 @@ services:
     trellis_workers_per_gpu: 1
 
 qc:
+  # Active processing allow-list (flux / trellis2_3d / gate_a judge scope).
   edit_types: [modification, scale]
 
-  # Gate E first-pass scope (before del_add).  Matches edit_types; deletion is
-  # skipped by the runner; addition optional via QC_ONLY_TYPES=addition later.
+  # Gate E first-pass scope — MUST match edit_types for the pre-del_add judge.
+  # del_add runs after this; deletion is never Gate-E-judged; addition optional
+  # via a later partial run: QC_ONLY_TYPES=addition STAGES=gate_quality FORCE=1
   gate_quality_types: [modification, scale]
 
   thresholds_by_type:

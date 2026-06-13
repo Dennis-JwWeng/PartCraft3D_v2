@@ -1059,6 +1059,7 @@ def build_semantic_list(
     """
     import re as _re
     import numpy as _np
+    from scripts.data_prep.mesh_sources import open_mesh
 
     pid_to_name_raw: list = []
     if img_npz is not None and Path(img_npz).is_file():
@@ -1067,7 +1068,7 @@ def build_semantic_list(
             sm = json.loads(bytes(z["split_mesh.json"]).decode())
             pid_to_name_raw = sm.get("part_id_to_name", [])
 
-    z2 = _np.load(mesh_npz, allow_pickle=True)
+    z2 = open_mesh(mesh_npz)
 
     def _parse_pid(k: str) -> int | None:
         m = _re.search(r"\d+", k)

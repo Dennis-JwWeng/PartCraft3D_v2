@@ -30,6 +30,8 @@ import trimesh
 
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT))
+from scripts.data_prep.mesh_sources import open_mesh, mesh_available  # noqa: E402
+sys.path.insert(0, str(_ROOT))
 
 from .paths import ObjectContext
 from . import services_cfg as psvc
@@ -161,7 +163,7 @@ def _normalize(v: torch.Tensor) -> torch.Tensor:
 
 
 def _load_full_mesh(npz_path: Path) -> trimesh.Trimesh:
-    d = np.load(npz_path, allow_pickle=True)
+    d = open_mesh(npz_path)
     if "full.glb" not in d.files:
         raise KeyError(f"no 'full.glb' in {npz_path}; have {d.files}")
     scene = trimesh.load(io.BytesIO(d["full.glb"].tobytes()),
@@ -249,7 +251,7 @@ def _slat_from_arrays(feats: np.ndarray, coords: np.ndarray):
 def _encode_one(ctx: ObjectContext, encoders: dict, p25_cfg: dict, logger,
                 pipeline=None, envmap=None, force: bool = False) -> Path:
     """Encode full mesh → shape/tex/ss latents; optionally render unified overview."""
-    if ctx.mesh_npz is None or not ctx.mesh_npz.is_file():
+    if not mesh_available(ctx.mesh_npz):
         raise FileNotFoundError(f"missing mesh_npz: {ctx.mesh_npz}")
 
     grid_size = int(p25_cfg.get("trellis2_p1_grid", 1024))

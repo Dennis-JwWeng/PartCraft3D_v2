@@ -63,12 +63,12 @@ from .gen_edits import Phase1Result, backfill_overviews
 # strictly invisible (pixel_counts all zero — the zero_visible_pixels case).
 VIS_MIN_PIXELS = int(os.environ.get("VIS_MIN_PIXELS", "1"))
 
-# ───────────────────── white-model (白模) detection ──────────────────────────
-# Some inputs are untextured white/grey meshes ("白模").  Their TOP-row RGB has
-# no real colour/material, so the VLM would only *hallucinate* material / color
-# edits (observed: every colour edit falls back to the same "deep crimson red").
-# When detected we ZERO the material+color quota and tell the VLM to reason by
-# shape only — deletion / modification / scale / global still apply.
+# ───────────────────── white-model (白模) metric (detection RETIRED) ─────────
+# Some inputs are untextured white/grey meshes ("白模").  Detection used to
+# zero the material/color quota and make S2 skip the texture stage; that
+# behaviour is REMOVED — all objects are treated uniformly (tex latents are
+# required for every edit).  colorful_frac is still computed and written to
+# visibility.json as a pure audit metric.
 #
 # Detection: of the foreground pixels (object region, taken from the BOTTOM-row
 # segmentation mask, sampled in the aligned TOP-row RGB), what fraction have a
@@ -247,11 +247,12 @@ def _prepare_edit_menu_image_worker(args: tuple):
     visible = [p for p in all_pids if pixel_counts[p] >= VIS_MIN_PIXELS]
     dropped = [p for p in all_pids if pixel_counts[p] < VIS_MIN_PIXELS]
 
-    # White-model (白模) detection: untextured mesh → no real colour/material to
-    # see, so the VLM can only hallucinate material/color edits.  Downgrade by
-    # zeroing those two quotas; geometry/structure edits are unaffected.
+    # White-model (白模) AUTO-detection removed: every object keeps the full
+    # material/color quota and the downstream S2 texture stage always runs
+    # (all edits must ship tex latents).  colorful_frac stays as a pure audit
+    # metric in visibility.json; white_model is hard-wired False.
     cf = white_model_colorful_frac(ov_img)
-    is_white = cf < WHITE_MODEL_COLORFUL_FRAC
+    is_white = False
 
     # Audit record next to the overview — ties back to the zero_visible analysis.
     try:
@@ -275,16 +276,7 @@ def _prepare_edit_menu_image_worker(args: tuple):
     # never have to re-run gen_edits when more types are enabled downstream.
     # The active allow-list (qc.edit_types) gates only PROCESSING, not here.
     quota = compute_edit_quota(len(visible))
-    if is_white:
-        # 白模降级: skip material/color (would be pure guesses on an untextured mesh).
-        quota = {**quota, "material": 0, "color": 0}
     user_msg = _format_user_prompt(menu, quota, seed=hash(mesh_p.stem))
-    if is_white:
-        user_msg = (
-            "[NOTE: This is an UNTEXTURED white/grey model — it has no real "
-            "colours or materials. Reason from SHAPE only; do NOT infer or "
-            "mention specific colours/materials in any field.]\n\n"
-        ) + user_msg
     return user_msg, visible, quota, menu
 
 

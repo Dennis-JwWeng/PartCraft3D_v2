@@ -38,12 +38,31 @@ def thumb_b64(p: Path, size: int, quality: int) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
-def collect(shard_dir: Path, pad: int) -> list[dict]:
+def collect(shard_dir: Path, pads: list[int],
+            ext: dict[int, Path]) -> list[dict]:
+    """Rows keyed on the FIRST pad in ``pads`` (defines the subset); the other
+    pads contribute extra columns (blank cell when that repaste is missing).
+    ``ext`` maps pad → external root holding <obj_id>/<edit_id>/ outputs;
+    pads not in ``ext`` are read in-place (edits_3d/<id>/repaste_pad{P})."""
+    primary = pads[0]
+
+    def pad_dir(pad: int, obj: str, eid: str) -> Path:
+        if pad in ext:
+            return ext[pad] / obj / eid
+        return shard_dir / obj / "edits_3d" / eid / f"repaste_pad{pad}"
+
+    if primary in ext:
+        metas = sorted(ext[primary].glob("*/*/meta.json"))
+        keys = [(m.parents[1].name, m.parents[0].name) for m in metas]
+    else:
+        metas = sorted(shard_dir.glob(f"*/edits_3d/*/repaste_pad{primary}/meta.json"))
+        keys = [(m.parents[3].name, m.parents[1].name) for m in metas]
+
     rows = []
-    for meta_p in sorted(shard_dir.glob(f"*/edits_3d/*/repaste_pad{pad}/meta.json")):
+    for meta_p, (obj, eid) in zip(metas, keys):
         rp_dir = meta_p.parent
-        edit_dir = rp_dir.parent
-        obj_dir = edit_dir.parent.parent
+        obj_dir = shard_dir / obj
+        edit_dir = obj_dir / "edits_3d" / eid
         meta = json.loads(meta_p.read_text())
         view = meta.get("view_name", "")
         png = rp_dir / f"after_view_{view}.png"
@@ -57,19 +76,29 @@ def collect(shard_dir: Path, pad: int) -> list[dict]:
                 prompt = d.get("improved_prompt") or d.get("original_prompt") or ""
             except Exception:
                 pass
+        pastes = {}   # pad -> (png path, preserved count)
+        for p in pads:
+            d = pad_dir(p, obj, eid)
+            mp = d / "meta.json"
+            n_pres = -1
+            if mp.is_file():
+                try:
+                    n_pres = json.loads(mp.read_text()).get("preserved", -1)
+                except Exception:
+                    pass
+            pastes[p] = (d / f"after_view_{view}.png", n_pres)
         rows.append({
             "obj": obj_dir.name,
             "edit_id": edit_dir.name,
             "view": view,
             "parts": meta.get("parts", []),
             "tokens": meta.get("tokens_total", 0),
-            "preserved": meta.get("preserved", 0),
             "white": bool(meta.get("white_model", False)),
             "prompt": prompt,
             "before": obj_dir / "gate_views" / f"before_view_{view}.png",
             "cond": obj_dir / "edits_2d" / f"{edit_dir.name}_edited.png",
             "after_pad4": edit_dir / f"after_view_{view}.png",
-            "after_pad0": png,
+            "pastes": pastes,
         })
     return rows
 
@@ -90,32 +119,39 @@ CSS = """
 """
 
 
-def page_html(rows: list[dict], title: str, nav: str, thumb: int, quality: int) -> str:
+def page_html(rows: list[dict], pads: list[int], title: str, nav: str,
+              thumb: int, quality: int) -> str:
     trs = []
     for r in rows:
         white = ' <span class="white">[white]</span>' if r["white"] else ""
-        keep_pct = 100.0 * r["preserved"] / max(r["tokens"], 1)
+        stats = " · ".join(
+            f"pad{p}: {n}/{r['tokens']}" for p, (_, n) in r["pastes"].items() if n >= 0)
+        paste_tds = "".join(
+            f'<td><img src="{thumb_b64(png, thumb, quality)}" loading="lazy"></td>'
+            for png, _ in r["pastes"].values())
         trs.append(f"""
       <tr>
         <td class="eid">{html.escape(r['edit_id'])}{white}
           <div class="meta">obj {html.escape(r['obj'])}<br>
             parts {r['parts']} · view <b>{html.escape(r['view'])}</b><br>
-            pad0 paste: {r['preserved']}/{r['tokens']} tokens ({keep_pct:.0f}% preserved)</div>
+            preserved {html.escape(stats)}</div>
           <div class="prompt">{html.escape(r['prompt'])}</div></td>
         <td><img src="{thumb_b64(r['before'], thumb, quality)}" loading="lazy"></td>
         <td><img src="{thumb_b64(r['cond'], thumb, quality)}" loading="lazy"></td>
         <td><img src="{thumb_b64(r['after_pad4'], thumb, quality)}" loading="lazy"></td>
-        <td><img src="{thumb_b64(r['after_pad0'], thumb, quality)}" loading="lazy"></td>
+        {paste_tds}
       </tr>""")
+    paste_ths = "".join(f"<th>After pad{p}（重贴）</th>" for p in pads)
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>{html.escape(title)}</title>
 <style>{CSS}</style></head><body>
 <h1>{html.escape(title)}</h1>
 <div class="nav">{nav}</div>
 <p class="intro">同一 best-view 相机（FLUX condition 视角）。Before = 原始 mesh 渲染；
-2D condition = FLUX 编辑图；After pad4 = 生产 pad4 贴回；After pad0 = pad0 重贴（更大保留区，无重新生成）。</p>
+2D condition = FLUX 编辑图；After pad4 = 生产 pad4 贴回；After padN = 用 padN 掩码
+离线重贴（pad 越小保留区越大，零重新生成）。</p>
 <table>
-  <thead><tr><th>edit</th><th>Before</th><th>2D condition</th><th>After pad4（生产）</th><th>After pad0（重贴）</th></tr></thead>
+  <thead><tr><th>edit</th><th>Before</th><th>2D condition</th><th>After pad4（生产）</th>{paste_ths}</tr></thead>
   <tbody>{''.join(trs)}</tbody>
 </table>
 <div class="nav">{nav}</div>
@@ -126,7 +162,12 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="data/Pxform_v2/prod_posthoc_no2dqc")
     ap.add_argument("--shard", required=True)
-    ap.add_argument("--pad", type=int, default=0)
+    ap.add_argument("--pads", default="0",
+                    help="comma list of repaste pads; FIRST defines the row "
+                         "subset, the rest add columns (e.g. '2,0')")
+    ap.add_argument("--ext", action="append", default=[],
+                    help="pad:root for externally-stored outputs, e.g. "
+                         "'2:reports/repaste_pad2_shard00' (repeatable)")
     ap.add_argument("--out-dir", default="")
     ap.add_argument("--per-page", type=int, default=100)
     ap.add_argument("--thumb", type=int, default=320)
@@ -135,26 +176,31 @@ def main() -> None:
     args = ap.parse_args()
 
     shard_dir = Path(args.root) / "objects" / args.shard
-    rows = collect(shard_dir, args.pad)
+    pads = [int(p) for p in args.pads.split(",")]
+    ext = {int(e.split(":", 1)[0]): Path(e.split(":", 1)[1]) for e in args.ext}
+    rows = collect(shard_dir, pads, ext)
     if args.limit:
         rows = rows[: args.limit]
     if not rows:
         print("no repaste rows found", file=sys.stderr)
         sys.exit(1)
 
-    out_dir = Path(args.out_dir or f"reports/repaste_pad{args.pad}_shard{args.shard}")
+    pads_label = "/".join(f"pad{p}" for p in pads)
+    out_dir = Path(args.out_dir
+                   or f"reports/repaste_pad{pads[0]}_shard{args.shard}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     pages = [rows[i: i + args.per_page] for i in range(0, len(rows), args.per_page)]
     links = " ".join(f'<a href="page_{i + 1:03d}.html">p{i + 1}</a>'
                      for i in range(len(pages)))
     for i, pr in enumerate(pages):
-        title = (f"pad4 vs pad{args.pad} 重贴对比 — shard {args.shard} · "
+        title = (f"pad4 vs {pads_label} 重贴对比 — shard {args.shard} · "
                  f"page {i + 1}/{len(pages)} · edits {i * args.per_page + 1}-"
                  f"{i * args.per_page + len(pr)}/{len(rows)}")
         nav = f'<a href="index.html">index</a> {links}'
         (out_dir / f"page_{i + 1:03d}.html").write_text(
-            page_html(pr, title, nav, args.thumb, args.quality), encoding="utf-8")
+            page_html(pr, pads, title, nav, args.thumb, args.quality),
+            encoding="utf-8")
         print(f"page_{i + 1:03d}.html  {len(pr)} rows")
 
     n_white = sum(r["white"] for r in rows)
@@ -166,10 +212,10 @@ def main() -> None:
     (out_dir / "index.html").write_text(f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>repaste compare index</title>
 <style>{CSS} li {{ margin: 4px 0; }} a {{ color: #6ea8fe; }}</style></head><body>
-<h1>pad4 vs pad{args.pad} 重贴对比 — shard {args.shard}</h1>
+<h1>pad4 vs {pads_label} 重贴对比 — shard {args.shard}</h1>
 <p class="intro">{len(rows)} edits（gate-E pass，重贴完成），其中 white-model {n_white} 个 ·
-每页 {args.per_page} 行 · 列：Before / 2D condition / After pad4（生产） / After pad{args.pad}（重贴），
-全部同一 best-view 相机。</p>
+每页 {args.per_page} 行 · 列：Before / 2D condition / After pad4（生产） /
+{' / '.join(f'After pad{p}（重贴）' for p in pads)}，全部同一 best-view 相机。</p>
 <ul>{idx_rows}</ul>
 </body></html>""", encoding="utf-8")
     print(f"index.html → {out_dir}  ({len(rows)} rows, {len(pages)} pages, "

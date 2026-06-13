@@ -33,6 +33,8 @@ import numpy as np
 import torch
 import trimesh
 
+from scripts.data_prep.mesh_sources import open_mesh
+
 
 # Y-up (partverse) → Z-up (TRELLIS) canonical rotation, row-vertex convention:
 # (x, y, z) → (x, -z, y).  Identical to trellis2_encode._CANON_ROT so o-voxel
@@ -115,7 +117,7 @@ def yaw_pitch_to_extrinsics_intrinsics(
 
 def load_full_scene(mesh_npz: Path) -> trimesh.Scene:
     """Load ``full.glb`` from a partverse mesh.npz, **keeping materials**."""
-    d = np.load(mesh_npz, allow_pickle=True)
+    d = open_mesh(mesh_npz)
     if "full.glb" not in d.files:
         raise KeyError(f"no 'full.glb' in {mesh_npz}; have {d.files}")
     scene = trimesh.load(io.BytesIO(d["full.glb"].tobytes()),
@@ -247,7 +249,7 @@ def load_part_scenes(mesh_npz: Path) -> dict[int, trimesh.Scene]:
     applying the full mesh's normalization ``M`` lands them in the shared frame.
     """
     import re
-    d = np.load(mesh_npz, allow_pickle=True)
+    d = open_mesh(mesh_npz)
     out = {}
     for k in d.files:
         m = re.match(r"^part_(\d+)\.glb$", k)

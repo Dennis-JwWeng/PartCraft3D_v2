@@ -37,6 +37,8 @@ import numpy as np
 import torch
 import trimesh
 
+from scripts.data_prep.mesh_sources import open_mesh
+
 _T2 = os.environ.get("TRELLIS2_DIR", "/mnt/zsn/3dobject/TRELLIS.2")
 if _T2 not in sys.path:
     sys.path.insert(0, _T2)
@@ -56,7 +58,7 @@ _CANON_ROT = torch.tensor([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=torch.float3
 
 
 def _load_part_mesh(mesh_npz_path: Path, part_id: int) -> trimesh.Trimesh:
-    d = np.load(mesh_npz_path, allow_pickle=True)
+    d = open_mesh(mesh_npz_path)
     key = f"part_{part_id}.glb"
     if key not in d.files:
         raise KeyError(f"{key} not in {mesh_npz_path}; have {d.files}")
@@ -144,7 +146,7 @@ def part_keep_mask(
 
     # Determine the unit-normalization (center+scale) from the FULL mesh
     # so part voxelization is in the same frame P1 was encoded under.
-    d = np.load(mesh_npz_path, allow_pickle=True)
+    d = open_mesh(mesh_npz_path)
     if full_mesh_for_normalize:
         g = trimesh.load(io.BytesIO(d["full.glb"].tobytes()),
                          file_type="glb", process=False)
@@ -250,7 +252,7 @@ def _target_block_keys_64(
     ``canonical=True`` applies :data:`_CANON_ROT` after center+scale (same as the
     canonical encode) so the mask aligns with canonical-frame coords0.
     """
-    d = np.load(mesh_npz_path, allow_pickle=True)
+    d = open_mesh(mesh_npz_path)
     center, scale = (_full_center_scale(d) if full_mesh_for_normalize
                      else (None, None))
     blocks: list[torch.Tensor] = []
@@ -283,7 +285,7 @@ def _keys_to_grid(keys: torch.Tensor) -> torch.Tensor:
 def _all_part_ids(mesh_npz_path: Path) -> list[int]:
     """Every ``part_<id>.glb`` id stored in the mesh npz, sorted."""
     import re
-    d = np.load(mesh_npz_path, allow_pickle=True)
+    d = open_mesh(mesh_npz_path)
     ids = []
     for f in d.files:
         m = re.match(r"part_(\d+)\.glb$", f)

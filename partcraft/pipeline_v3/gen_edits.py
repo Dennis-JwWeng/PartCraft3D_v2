@@ -28,7 +28,9 @@ import json
 import os
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait as _fut_wait
+from itertools import islice as _islice
+from multiprocessing import get_context
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -42,6 +44,7 @@ from partcraft.pipeline_v3.vlm_core import (  # noqa: E402
 
 from .paths import ObjectContext
 from .status import update_step, step_done, STATUS_OK, STATUS_FAIL, STATUS_SKIP
+from scripts.data_prep.mesh_sources import mesh_available
 
 
 @dataclass
@@ -386,7 +389,7 @@ def backfill_overviews(
 
     tasks: list[tuple] = []
     for ctx in ctxs:
-        if ctx.mesh_npz is None or not ctx.mesh_npz.is_file():
+        if not mesh_available(ctx.mesh_npz):
             continue
         img = (
             str(ctx.image_npz)
@@ -408,26 +411,51 @@ def backfill_overviews(
 
     n_ok = n_skip = n_err = n_done = 0
     errors: list[tuple[str, str]] = []
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futs = [pool.submit(_render_overview_worker, t) for t in tasks]
-        for fut in futs:
-            try:
-                oid, status, err = fut.result()
-            except Exception as e:
-                n_err += 1
-                errors.append(("?", str(e)))
-                oid, status = "?", "err"
-            if status == "ok":
-                n_ok += 1
-            elif status == "skip":
-                n_skip += 1
-            else:
-                n_err += 1
-                errors.append((oid, err))
-            n_done += 1
-            if n_done % log_every == 0 or n_done == n_total:
-                log.info("overview backfill: %d/%d  ok=%d skip=%d err=%d",
-                         n_done, n_total, n_ok, n_skip, n_err)
+    # spawn (not fork): forking these workers lazily from inside the asyncio
+    # event loop raced the call-queue feeder thread and could inherit a locked
+    # queue mutex → permanent deadlock (observed wedging an XL shard for hours).
+    # spawn starts each worker with a fresh interpreter, so no parent lock state
+    # is inherited.  _render_overview_worker is top-level + args are str/bool →
+    # spawn-picklable.
+    # Bounded sliding-window submission.  Submitting all N tasks at once races
+    # the spawn workers' slow cold-import startup (each imports the trellis2
+    # o-voxel renderer): the executor's call/wakeup pipes fill before any worker
+    # drains them and pool.submit() wedges forever at 0% CPU (observed: XL shard
+    # hung 4.5h in submit→wakeup→_send).  Keeping ≤2*n_workers futures in flight
+    # means submit() never outruns the workers, so the pipes can't back up.
+    window = max(1, n_workers * 2)
+    task_it = iter(tasks)
+
+    def _tally(fut):
+        nonlocal n_ok, n_skip, n_err, n_done
+        try:
+            oid, status, err = fut.result()
+        except Exception as e:
+            oid, status, err = "?", "err", str(e)
+        if status == "ok":
+            n_ok += 1
+        elif status == "skip":
+            n_skip += 1
+        else:
+            n_err += 1
+            errors.append((oid, err))
+        n_done += 1
+        if n_done % log_every == 0 or n_done == n_total:
+            log.info("overview backfill: %d/%d  ok=%d skip=%d err=%d",
+                     n_done, n_total, n_ok, n_skip, n_err)
+
+    with ProcessPoolExecutor(
+        max_workers=n_workers, mp_context=get_context("spawn")
+    ) as pool:
+        inflight = {pool.submit(_render_overview_worker, t)
+                    for t in _islice(task_it, window)}
+        while inflight:
+            done, inflight = _fut_wait(inflight, return_when=FIRST_COMPLETED)
+            # backfill the window before tallying so workers never idle
+            for t in _islice(task_it, len(done)):
+                inflight.add(pool.submit(_render_overview_worker, t))
+            for fut in done:
+                _tally(fut)
 
     if errors:
         log.warning("overview backfill: %d errors (showing first 5):", len(errors))
@@ -530,7 +558,7 @@ async def gen_edits_streaming(
         if not force and step_done(ctx, "s1_phase1"):
             results.append(Phase1Result(ctx.obj_id, ok=True))
             continue
-        if ctx.mesh_npz is None or not ctx.mesh_npz.is_file():
+        if not mesh_available(ctx.mesh_npz):
             results.append(Phase1Result(ctx.obj_id, ok=False, error="no_input"))
             continue
         todo.append(ctx)
@@ -560,7 +588,12 @@ async def gen_edits_streaming(
         return results
 
     loop = asyncio.get_running_loop()
-    pool = ProcessPoolExecutor(max_workers=n_prerender_workers)
+    # spawn (not fork) — see backfill_overviews: avoids the fork-from-asyncio
+    # call-queue-lock deadlock.  _prepare_edit_menu_worker is top-level + str
+    # args → spawn-picklable.
+    pool = ProcessPoolExecutor(
+        max_workers=n_prerender_workers, mp_context=get_context("spawn")
+    )
     queue: asyncio.Queue = asyncio.Queue(maxsize=2 * len(vlm_urls))
 
     clients = [AsyncOpenAI(base_url=u, api_key="EMPTY") for u in vlm_urls]

@@ -55,25 +55,42 @@ class DatasetRoots:
     normalized_glb_dir: Path | None = None
     anno_dir: Path | None = None
     require_images_npz: bool = True    # Trellis2 mesh-only packs omit images NPZ
+    # Per-data-source locator/enumerator (see scripts/data_prep/mesh_sources.py).
+    # ``input_npz_paths`` and ``run_trellis2`` enumeration delegate to it, so the
+    # raw PartVerse XL source needs no pack — refs point straight at the raw layout.
+    mesh_source: object | None = None
 
     @classmethod
     def from_pipeline_cfg(cls, cfg: dict) -> "DatasetRoots":
+        from scripts.data_prep.mesh_sources import get_mesh_source
         data = cfg.get("data") or {}
         raw_slat = data.get("slat_dir")
         raw_glb  = data.get("normalized_glb_dir")
         raw_anno = data.get("anno_dir")
+        source = get_mesh_source(cfg)
         return cls(
             images_root=Path(data.get("images_root", DEFAULT_IMAGES_ROOT)),
             mesh_root=Path(data.get("mesh_root", DEFAULT_MESH_ROOT)),
             slat_dir=Path(raw_slat) if raw_slat else None,
             normalized_glb_dir=Path(raw_glb) if raw_glb else None,
             anno_dir=Path(raw_anno) if raw_anno else None,
-            require_images_npz=bool(data.get("require_images_npz", True)),
+            require_images_npz=bool(getattr(source, "require_images_npz", True)),
+            mesh_source=source,
         )
 
     def input_npz_paths(self, shard: str | int, obj_id: str) -> tuple[Path, Path]:
-        """Return ``(mesh_npz, image_npz)`` under ``<root>/<shard>/<obj_id>.npz``."""
+        """Return ``(mesh_ref, image_ref)`` for one object.
+
+        Delegates to the configured :class:`MeshSource` — a packed-NPZ source
+        yields ``<root>/<shard>/<obj_id>.npz``; the raw-XL source yields the raw
+        ``textured_part_glbs/<obj_id>`` directory.  Readers open either via
+        ``mesh_sources.open_mesh`` (type-dispatched), so callers stay uniform."""
         s = normalize_shard(shard)
+        if self.mesh_source is not None:
+            return (
+                self.mesh_source.mesh_ref(s, obj_id),
+                self.mesh_source.image_ref(s, obj_id),
+            )
         return (
             self.mesh_root / s / f"{obj_id}.npz",
             self.images_root / s / f"{obj_id}.npz",

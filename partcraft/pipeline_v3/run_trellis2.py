@@ -56,6 +56,7 @@ import yaml
 from .paths import (DatasetRoots, PipelineRoot, ObjectContext, normalize_shard,
                       resolve_blender_executable)
 from .status import rebuild_manifest, manifest_summary, step_done, load_status
+from scripts.data_prep.mesh_sources import mesh_available
 from .edit_status_io import build_prereq_map, edit_needs_step
 from .qc_io import is_gate_a_failed
 from .specs import iter_flux_specs
@@ -123,14 +124,19 @@ def resolve_ctxs(
     if obj_ids:
         ids = obj_ids
     elif all_objs:
-        # Always use mesh_root as the authoritative full set of objects for
-        # this shard, then union with any existing output dirs so that
-        # in-progress objects are never dropped on resume.
-        mesh_shard = roots.mesh_root / shard
-        mesh_ids = (
-            {p.stem for p in mesh_shard.glob("*.npz")}
-            if mesh_shard.is_dir() else set()
-        )
+        # Authoritative full set for this shard comes from the data source
+        # (packed-NPZ globs <root>/<shard>/*.npz; raw-XL partitions the
+        # textured∩captioned id list — no on-disk shard dirs), then union with
+        # any existing output dirs so in-progress objects survive a resume.
+        num_shards = int((cfg.get("data") or {}).get("num_shards", 10))
+        if roots.mesh_source is not None:
+            mesh_ids = set(roots.mesh_source.list_object_ids(shard, num_shards))
+        else:
+            mesh_shard = roots.mesh_root / shard
+            mesh_ids = (
+                {p.stem for p in mesh_shard.glob("*.npz")}
+                if mesh_shard.is_dir() else set()
+            )
         existing_ids = (
             {d.name for d in root.shard_dir(shard).iterdir() if d.is_dir()}
             if root.shard_dir(shard).is_dir() else set()
@@ -203,6 +209,30 @@ def slice_for_gpu_lpt(
     return buckets[i]
 
 
+def _round_robin_pending(ctx: ObjectContext, step: str | None, force: bool) -> bool:
+    """True iff *ctx* still has work for a round-robin GPU step (encode/del_add).
+
+    Used to filter the object list to UNFINISHED work BEFORE round-robin
+    slicing, so every launch spreads the remaining objects evenly across all
+    workers instead of leaving already-done index-buckets to exit early while a
+    couple of buckets carry the whole backlog.
+
+    File-based on purpose: the encode step has no post-step file validator, so
+    its status record can be rubber-stamped ``ok`` even when ``shape_slat.npz``
+    is missing (see ``_backfill_missing_encode``) — trusting the status would
+    wrongly drop those casualties.  ``force`` keeps everything (full re-run).
+    """
+    if force:
+        return True
+    if step == "trellis2_encode":
+        return not (ctx.dir / "p1_encode" / "shape_slat.npz").is_file()
+    if step == "del_add":
+        from .del_add_reencode import _object_has_pending
+        return _object_has_pending(ctx, force=False)
+    # Unknown round-robin step → don't filter (process the full slice).
+    return True
+
+
 def _gpu_shard_ctxs(
     ctxs: list[ObjectContext],
     cfg: dict,
@@ -210,6 +240,7 @@ def _gpu_shard_ctxs(
     shard_i: int,
     shard_n: int,
     slice_steps: list[str] | None,
+    force: bool = False,
 ) -> list[ObjectContext]:
     """Apply ``--gpu-shard``: round-robin, or LPT when running ``trellis2_3d``.
 
@@ -217,14 +248,23 @@ def _gpu_shard_ctxs(
 
     Objects with **zero** pending ``s5`` edits are excluded from LPT (they would
     otherwise all tie-break onto the same shard and waste wall time scanning).
+
+    For the round-robin steps (``trellis2_encode``/``del_add``) the list is
+    first filtered to UNFINISHED objects, so the remaining work is partitioned
+    evenly every launch (no resume backlog on a couple of workers).  The filter
+    is a deterministic pure function of on-disk state, evaluated by every child
+    before any worker starts processing → all children compute the identical
+    pending set and slice it consistently.  ``TRELLIS_SHARD_MODE=roundrobin``
+    or ``--force`` disables the filter (process the full static slice).
     """
     if shard_n <= 0:
         return ctxs
     mode = os.environ.get("TRELLIS_SHARD_MODE", "lpt").strip().lower()
+    legacy_rr = mode in ("roundrobin", "rr", "0")
     use_lpt = (
         slice_steps
         and ("trellis2_3d" in slice_steps)
-        and mode not in ("roundrobin", "rr", "0")
+        and not legacy_rr
     )
     if use_lpt:
         pm = build_prereq_map(cfg)
@@ -238,6 +278,14 @@ def _gpu_shard_ctxs(
             out.extend(slice_for_gpu_lpt(act_ctxs, shard_i, shard_n, act_w))
         out.extend([c for k, c in enumerate(zeros) if k % shard_n == shard_i])
         return out
+    # Round-robin steps: balance REMAINING work, not raw index, across launches.
+    step = (slice_steps[0] if slice_steps else None)
+    if not legacy_rr:
+        n_all = len(ctxs)
+        ctxs = [c for c in ctxs if _round_robin_pending(c, step, force)]
+        if shard_i == 0:
+            LOG.info("[%s] dynamic re-slice: %d/%d objects pending → %d workers",
+                     step, len(ctxs), n_all, shard_n)
     return slice_for_gpu(ctxs, shard_i, shard_n)
 
 
@@ -292,7 +340,7 @@ def check_inputs(
     for ctx in ctxs:
         missing: list[str] = []
 
-        if ctx.mesh_npz is None or not ctx.mesh_npz.is_file():
+        if not mesh_available(ctx.mesh_npz):
             missing.append(f"mesh_npz ({ctx.mesh_npz})")
 
         if roots.require_images_npz:
@@ -326,6 +374,73 @@ def check_inputs(
         )
 
     log.info("INPUT CHECK PASSED — all %d objects have required inputs", len(ctxs))
+
+
+def apply_xl_input_patch(
+    ctxs: list[ObjectContext],
+    cfg: dict,
+    log: logging.Logger,
+) -> list[ObjectContext]:
+    """Filter raw PartVerse XL objects that will never complete (CPU preflight).
+
+    Controlled by ``data.xl_preflight`` in the pipeline YAML::
+
+        xl_preflight:
+          enabled: true
+          max_parts: 16
+          filter: true       # drop blocked ids from this run (default)
+          strict: false      # abort when any roster id is blocked
+          check_assemble: false
+
+    Offline lists: ``python scripts/ops/preflight_partversexl.py ...``
+    """
+    from scripts.data_prep.xl_preflight import (
+        inspect_batch, partition_reports, preflight_config,
+    )
+
+    pf = preflight_config(cfg)
+    if not pf["enabled"]:
+        return ctxs
+
+    data = cfg.get("data") or {}
+    source = str(data.get("source", "")).strip().lower()
+    if source not in ("partversexl_raw", "xl_raw", "raw_xl"):
+        return ctxs
+
+    reports = inspect_batch((c.obj_id for c in ctxs), cfg)
+    allow, blocked = partition_reports(reports)
+    if not blocked:
+        log.info("xl_preflight: all %d objects pass", len(allow))
+        return ctxs
+
+    by_reason: dict[str, int] = {}
+    for r in blocked:
+        for reason in r.reasons:
+            key = reason.split("(", 1)[0]
+            by_reason[key] = by_reason.get(key, 0) + 1
+    log.warning(
+        "xl_preflight: block=%d/%d reasons=%s",
+        len(blocked), len(ctxs), by_reason,
+    )
+    for r in blocked[:8]:
+        log.warning("  xl_preflight BLOCK %s: %s", r.obj_id, ";".join(r.reasons))
+    if len(blocked) > 8:
+        log.warning("  xl_preflight ... and %d more blocked", len(blocked) - 8)
+
+    if pf["strict"]:
+        raise SystemExit(
+            f"[XL PREFLIGHT FAILED] {len(blocked)}/{len(ctxs)} objects blocked — "
+            "run scripts/ops/preflight_partversexl.py to write allow/block lists"
+        )
+
+    if not pf["filter"]:
+        log.warning("xl_preflight: filter=false — keeping blocked objects in run")
+        return ctxs
+
+    allow_ids = {r.obj_id for r in allow}
+    filtered = [c for c in ctxs if c.obj_id in allow_ids]
+    log.info("xl_preflight: running %d/%d objects after filter", len(filtered), len(ctxs))
+    return filtered
 
 
 # ─────────────────── step dispatch ───────────────────────────────────
@@ -614,13 +729,30 @@ def dispatch_gpus(
         step, gpus, k, total,
     )
 
-    procs: list[tuple[str, int, subprocess.Popen]] = []
+    # trellis2_3d workers die hard (CuMesh CUDA fault / GPU hang on poison
+    # meshes) — corrupting their CUDA context with no in-process recovery.
+    # Supervise them: respawn a crashed/hung worker so its 1/N slice isn't
+    # abandoned, and force STABLE static slicing (TRELLIS_SHARD_MODE=roundrobin)
+    # so a respawn re-covers EXACTLY its slice — LPT-over-pending would
+    # re-balance the shrunken pending set and silently drop objects.
+    # Both GPU edit steps die hard on poison-mesh CUDA faults.  trellis2_3d uses
+    # the inflight/quarantine path (trellis2_3d.run); trellis2_encode is
+    # respawn-safe WITHOUT quarantine because it saves its core latents BEFORE
+    # the fragile auxiliary render — a respawn resumes and skip-dones the poison
+    # object (its latent already on disk) instead of re-crashing on it.
+    isolate = (step in ("trellis2_3d", "trellis2_encode")
+               and os.environ.get("TRELLIS2_ISOLATE_RESPAWN_DISABLE", "0") != "1")
+
+    procs: list[dict] = []
     for gpu_idx, gpu in enumerate(gpus):
         for w in range(k):
             shard_id = gpu_idx * k + w
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = gpu
             env.setdefault("ATTN_BACKEND", "flash_attn")
+            if isolate:
+                env["TRELLIS2_ISOLATE_RESPAWN"] = "1"
+                env["TRELLIS_SHARD_MODE"] = "roundrobin"
             cmd = [
                 sys.executable, "-m", "partcraft.pipeline_v3.run_trellis2",
                 "--config", str(cfg_path),
@@ -645,16 +777,96 @@ def dispatch_gpus(
                 "  GPU %s worker %d/%d (shard %d/%d): %s",
                 gpu, w + 1, k, shard_id, total, " ".join(cmd[-6:]),
             )
-            procs.append((gpu, w, subprocess.Popen(cmd, env=env)))
+            procs.append({"gpu": gpu, "w": w, "cmd": cmd, "env": env,
+                          "p": subprocess.Popen(cmd, env=env)})
 
-    LOG.info("[%s] waiting on %d children", step, len(procs))
+    LOG.info("[%s] waiting on %d children%s", step, len(procs),
+             "  (respawn-supervised)" if isolate else "")
+    if isolate:
+        return _supervise_respawn(procs, cfg_path, args.shard, k, step)
     rc = 0
-    for gpu, w, p in procs:
-        r = p.wait()
-        LOG.info("[%s] GPU %s worker %d/%d exit=%d", step, gpu, w + 1, k, r)
+    for pr in procs:
+        r = pr["p"].wait()
+        LOG.info("[%s] GPU %s worker %d/%d exit=%d", step, pr["gpu"], pr["w"] + 1, k, r)
         if r != 0:
             rc = r
     return rc
+
+
+def _safe_read(p: Path) -> str:
+    try:
+        return p.read_text().strip() or "?"
+    except OSError:
+        return "?"
+
+
+def _supervise_respawn(
+    procs: list[dict], cfg_path: Path, shard: str, k: int,
+    step: str = "trellis2_3d",
+) -> int:
+    """Poll GPU-edit workers; respawn any that crash (non-zero exit) or hang
+    (heartbeat marker stale past TRELLIS2_HANG_TIMEOUT_S).
+
+    The respawned worker re-runs the SAME ``--gpu-shard i/n`` static slice and
+    skip-dones what's already on disk.  For ``trellis2_3d`` ``run()``'s
+    ``_IsolateState`` also quarantines the in-flight (poison) object so a poison
+    mesh costs one object + one pipeline reload, not the slice.  ``trellis2_encode``
+    needs no quarantine — it saves its core latents BEFORE the fragile render, so
+    the respawn simply skip-dones the poison object.  Bounded by
+    TRELLIS2_RESPAWN_MAX per worker; once exhausted the remaining slice is
+    deferred to the next launch.
+    """
+    import time as _t
+    tag = f"[{step}]"
+    max_respawn = int(os.environ.get("TRELLIS2_RESPAWN_MAX", "8"))
+    hang_to = float(os.environ.get("TRELLIS2_HANG_TIMEOUT_S", "1200"))
+    root = resolve_root(load_config(cfg_path))
+    idir = root.global_dir / "_s5_isolate"
+    shard = normalize_shard(shard)   # match the worker's ctxs[0].shard heartbeat path
+    for pr in procs:
+        cvd = pr["env"].get("CUDA_VISIBLE_DEVICES", "x").replace(",", "_")
+        pr["hb"] = idir / f"{shard}_cvd{cvd}.inflight"
+        pr["respawns"] = 0
+        pr["done"] = False
+    agg = 0
+    while any(not pr["done"] for pr in procs):
+        for pr in procs:
+            if pr["done"]:
+                continue
+            rc = pr["p"].poll()
+            if rc is None:
+                hb = pr["hb"]
+                if hb.is_file():
+                    try:
+                        age = _t.time() - hb.stat().st_mtime
+                    except OSError:
+                        age = 0.0
+                    if age > hang_to:
+                        LOG.error(tag + " GPU %s hung %.0fs on %s — killing for respawn",
+                                  pr["gpu"], age, _safe_read(hb))
+                        try:
+                            pr["p"].kill()
+                        except OSError:
+                            pass
+                continue
+            if rc == 0:
+                pr["done"] = True
+                LOG.info(tag + " GPU %s worker %d/%d exit=0 (slice complete)",
+                         pr["gpu"], pr["w"] + 1, k)
+            elif pr["respawns"] < max_respawn:
+                pr["respawns"] += 1
+                LOG.warning(tag + " GPU %s worker %d/%d crashed exit=%d — respawn %d/%d "
+                            "(resumes slice)", pr["gpu"], pr["w"] + 1, k, rc,
+                            pr["respawns"], max_respawn)
+                pr["p"] = subprocess.Popen(pr["cmd"], env=pr["env"])
+            else:
+                pr["done"] = True
+                agg = rc
+                LOG.error(tag + " GPU %s worker %d/%d exit=%d — respawn budget "
+                          "(%d) exhausted; remaining slice deferred to next launch",
+                          pr["gpu"], pr["w"] + 1, k, rc, max_respawn)
+        _t.sleep(5)
+    return agg
 
 
 def _backfill_missing_encode(
@@ -744,6 +956,7 @@ def run_single_gpu(
             ctxs, cfg,
             shard_i=i, shard_n=n,
             slice_steps=[step] if step else None,
+            force=args.force,
         )
         LOG.info("[%s] gpu shard %d/%d -> %d objects", step, i, n, len(ctxs))
     ctxs = _apply_obj_limit(ctxs)
@@ -838,6 +1051,7 @@ def main():
             ctxs, cfg,
             shard_i=_i, shard_n=_n,
             slice_steps=_slice_steps_early,
+            force=args.force,
         )
         LOG.info("gpu-shard %d/%d → %d objects", _i, _n, len(ctxs))
     ctxs = _apply_obj_limit(ctxs)
@@ -849,6 +1063,7 @@ def main():
     if not args.single_gpu and not getattr(args, "skip_input_check", False):
         roots_for_check = DatasetRoots.from_pipeline_cfg(cfg)
         check_inputs(ctxs, roots_for_check, args.shard)
+        ctxs = apply_xl_input_patch(ctxs, cfg, LOG)
 
     if args.dry_run:
         for c in ctxs:

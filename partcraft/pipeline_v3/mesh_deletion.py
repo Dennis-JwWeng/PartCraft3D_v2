@@ -38,6 +38,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT / "scripts" / "tools"))
 
+from scripts.data_prep.mesh_sources import open_mesh, mesh_available  # noqa: E402
 from .paths import ObjectContext
 from .specs import EditSpec, iter_deletion_specs
 from .status import update_step, STATUS_OK, STATUS_FAIL
@@ -214,7 +215,7 @@ def _merge_surviving_parts_from_npz(
     if not mesh_npz.exists():
         return False
 
-    npz = np.load(mesh_npz, allow_pickle=False)
+    npz = open_mesh(mesh_npz, allow_pickle=False)
 
     glb_part_keys = [k for k in npz.files if k.startswith("part_") and k.endswith(".glb")]
     if not glb_part_keys:
@@ -293,10 +294,9 @@ def run_deletion_for_object(
     # rather than gating on the legacy normalized_glb_dir / anno_dir dirs
     # that are no longer required for the primary path.
     _mesh_has_glb = False
-    if ctx.mesh_npz is not None and ctx.mesh_npz.is_file():
+    if mesh_available(ctx.mesh_npz):
         try:
-            import numpy as _np_probe
-            _z = _np_probe.load(str(ctx.mesh_npz), allow_pickle=False)
+            _z = open_mesh(ctx.mesh_npz, allow_pickle=False)
             _mesh_has_glb = any(
                 k.startswith("part_") and k.endswith(".glb") for k in _z.files
             )
@@ -443,10 +443,9 @@ def run_deletion_batch(
     _sample_has_glb = False
     _ctxs_list = list(ctxs)
     for _c in _ctxs_list:
-        if _c.mesh_npz is not None and _c.mesh_npz.is_file():
+        if mesh_available(_c.mesh_npz):
             try:
-                import numpy as _np_probe
-                _z = _np_probe.load(str(_c.mesh_npz), allow_pickle=False)
+                _z = open_mesh(_c.mesh_npz, allow_pickle=False)
                 _sample_has_glb = any(
                     k.startswith("part_") and k.endswith(".glb") for k in _z.files
                 )
